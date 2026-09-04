@@ -187,6 +187,16 @@ class EndpointTests(LiveFunctionTestCase):
         self.assertEqual(len(lines), len(entries))
         self.assertEqual([json.loads(line) for line in lines], entries)
 
+    def test_object_name_is_prefixed_with_the_readings_own_timestamp(self) -> None:
+        # Lets a bucket listing be read in time order, since the console sorts
+        # objects by name.
+        entries = testdata.nightscout_entries(self.config)
+        result = self.post("entries", entries)
+
+        name = result.header("x-xdrip2gcp-object").rsplit("/", 1)[-1]
+        earliest = min(entry["date"] for entry in entries)
+        self.assertTrue(name.startswith(f"{earliest}-"), name)
+
     def test_stored_object_declares_the_ndjson_content_type(self) -> None:
         result = self.post("entries", testdata.nightscout_entries(self.config))
         metadata = bucket.describe_object(self.config, result.header("x-xdrip2gcp-object"))

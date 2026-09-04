@@ -85,8 +85,8 @@ Stage 1.1 describes.
 
 ### 2.3 Bucket naming
 
-The bucket is `xdrip2gcp-test-<suffix>`, e.g. `xdrip2gcp-test-c4278d`. Three reasons it is not
-plain `xdrip2gcp_test`:
+The bucket is `xdrip2gcp-test-<suffix>`, where the suffix is six random hex characters generated
+on first run. Three reasons it is not plain `xdrip2gcp_test`:
 
 * Bucket names share one global namespace across all of GCP, so an unsuffixed name is likely
   to collide once this repo is shared.
@@ -150,8 +150,8 @@ suite without a GCP account.
 
 ### 2.7 Verified results
 
-* Bucket `gs://xdrip2gcp-test-c4278d` exists in `us-central1`, `STANDARD` class, uniform access
-  on, public access prevention enforced, lifecycle deleting objects after 3 days.
+* The bucket exists in `us-central1`, `STANDARD` class, uniform access on, public access
+  prevention enforced, lifecycle deleting objects after 3 days.
 * A second `create_bucket.py` run reports both steps as no-ops.
 * `test-data/hello.txt` (92 bytes) and `test-data/sample.json` (500 bytes) write, verify, and
   re-write as no-ops.
@@ -195,6 +195,7 @@ src/xdrip2gcp/actions.py                      shared changed/no-op result type
 src/setup_gcp.py                              entry point: prepare the project
 src/deploy_function.py                        entry point: secret + deploy; --show-url, --force
 src/show_requests.py                          entry point: recent HTTP requests to the function
+src/config_env.py                             entry point: shell exports for the gcloud commands
 test/test_nightscout_core.py                  offline: the whole request path
 test/test_function_live.py                    live: deployment, HTTPS behaviour, bucket contents
 ```
@@ -258,7 +259,10 @@ Nightscout does, keeping the body protocol-faithful, and put our own metadata in
 Objects are written as newline-delimited JSON at:
 
 ```
-cgm-data/collection=entries/dt=2026-09-04/<sha256-of-contents>.ndjson
+cgm-data/collection=entries/dt=2026-09-04/1788564814746-d11ead64a0bf55b8.ndjson
+                                          |             |
+                                          |             sha256 of the contents
+                                          earliest reading's own epoch-ms timestamp
 ```
 
 * **NDJSON** because BigQuery ingests it natively, and BigQuery is the end goal.
@@ -268,6 +272,20 @@ cgm-data/collection=entries/dt=2026-09-04/<sha256-of-contents>.ndjson
   canonical. xDrip queues readings during an outage and retries, so the same batch can arrive
   twice; the retry resolves to the object already stored rather than a duplicate. A client that
   reorders JSON keys still produces the same object.
+* **A timestamp prefix taken from the documents themselves.** A hash alone sorts arbitrarily,
+  and since both the console and `gcloud storage ls` list objects by name, a bucket listing was
+  unreadable as a timeline — the newest upload could appear anywhere in the list. Prefixing with
+  the earliest timestamp the batch carries (`date`, `mills`, `created_at`, `sysTime` or
+  `dateString`, in that order, accepting epoch seconds, epoch milliseconds or ISO 8601) fixes
+  that without giving up idempotency: the prefix comes from the content, not the clock, so a
+  retry still produces the identical name. Fixed-width epoch milliseconds make alphabetical
+  order chronological order. Documents carrying no timestamp — xDrip's device status — keep
+  hash-only names.
+* One edge remains: the `dt=` partition uses the server's receive date, so a retry that crosses
+  UTC midnight lands in a different partition and does create a second object. xDrip's queue
+  drains in minutes, so this is theoretical rather than practical; deriving the partition from
+  the documents too would close it, at the cost of putting backfilled readings in older
+  partitions.
 * The function uploads with `if_generation_match=0`, meaning "only if absent", so a duplicate
   is rejected by Cloud Storage rather than overwritten and the response reports
   `x-xdrip2gcp-stored: duplicate`. This is also why the runtime identity needs only
@@ -350,33 +368,53 @@ python -m unittest discover -s test -t . -v
 ### 3.9 Verified results
 
 * Function `xdrip2gcp-nightscout-test` is ACTIVE in `us-central1` on `python314`, running as
-  `xdrip2gcp-fn-runtime`, at `https://xdrip2gcp-nightscout-test-2r2mgszbda-uc.a.run.app`.
+  `xdrip2gcp-fn-runtime`, at the Cloud Run URL reported by
+  `python src/deploy_function.py --show-url`.
 * First deploy took 88 seconds; a second run skips it in 9 and reports no-ops throughout.
 * Nightscout-shaped entries POST successfully, land as NDJSON under
-  `cgm-data/collection=entries/dt=.../<hash>.ndjson`, and a repeat POST is reported as a
-  duplicate with no second object.
-* 119 tests pass: 81 offline (well under a second), 38 live.
+  `cgm-data/collection=entries/dt=.../<epoch-ms>-<hash>.ndjson`, and a repeat POST is reported
+  as a duplicate with no second object.
+* 128 tests pass: 89 offline (well under a second), 39 live.
 
-## Stage 4: Send data to the test bucket from xDrip on a phone (Developer) ← In-Progress
+## Stage 4: Send data to the test bucket from xDrip on a phone (Developer) ✓ Done
 
 Nothing new gets built here. The Stage 3 function already speaks Nightscout's REST API, so
 xDrip needs no special treatment: it is pointed at our endpoint exactly as it would be pointed
 at a real Nightscout site.
 
-### 4.1 Get the base URL
+### 4.1 Set up a shell for the commands below
 
-On the computer, in the repo:
+Two of this project's names are specific to whoever set it up: the bucket's random suffix and
+the function's generated hostname. Neither belongs in a checked-in document, so the commands
+here read them from the configuration instead:
 
 ```bash
 conda activate xdrip2gcp
+eval "$(python src/config_env.py)"
+```
+
+That exports `XDRIP2GCP_BUCKET`, `XDRIP2GCP_BUCKET_URI`, `XDRIP2GCP_FUNCTION`,
+`XDRIP2GCP_REGION`, `XDRIP2GCP_URL` and `CLOUDSDK_PYTHON` — the last one covering the manual
+export from 1.1. Run `python src/config_env.py` on its own to see the values.
+
+The Nightscout password is deliberately excluded: exported variables are inherited by every
+child process and land in shell history, which is the wrong place for a credential.
+
+### 4.2 Get the base URL
+
+```bash
 python src/deploy_function.py --show-url
 ```
 
-The second line is the string to put into xDrip, already in the format the app expects:
+The first line is the endpoint. The second is the string to put into xDrip, already in the
+format the app expects:
 
 ```
-https://<password>@xdrip2gcp-nightscout-test-2r2mgszbda-uc.a.run.app/api/v1/
+https://<password>@<function-host>/api/v1/
 ```
+
+Both the password and the host are filled in for you; `<function-host>` is the same value as
+`XDRIP2GCP_URL` without its `https://`.
 
 The password is 32 URL-safe characters (letters, digits, `-` and `_` only), so it needs no
 escaping and can be typed or pasted verbatim. It is the only thing guarding a publicly
@@ -384,7 +422,7 @@ reachable endpoint, so treat it like any other password: a password manager's se
 good way to move it to the phone, and it should not be pasted anywhere it persists in
 plaintext, such as a chat app or email to yourself.
 
-### 4.2 Confirm the endpoint works before touching the phone
+### 4.3 Confirm the endpoint works before touching the phone
 
 ```bash
 python -m unittest test.test_function_live
@@ -393,11 +431,11 @@ python -m unittest test.test_function_live
 That exercises authentication and a real write end to end. If those pass, any failure on the
 phone is a configuration problem in xDrip, not a problem with the function.
 
-### 4.3 Configure xDrip
+### 4.4 Configure xDrip
 
 1. `Settings` → `Cloud Upload` → `Nightscout Sync (REST-API)`.
 2. Enable the feature with the toggle at the top of that page.
-3. Tap `Base URL` and enter the whole string from 4.1, including the trailing `/api/v1/`.
+3. Tap `Base URL` and enter the whole string from 4.2, including the trailing `/api/v1/`.
 4. Leave anything that *downloads* from Nightscout switched off. The function is write-only by
    design, so following or backfilling from it will not work. In particular, do not also set
    `Settings` → `Hardware Data Source` → `Nightscout Follower`.
@@ -408,13 +446,17 @@ xDrip accepts several sites in the `Base URL` field separated by spaces. Worth k
 also upload to a real Nightscout: when one site is down, xDrip clears its queue as soon as
 *any* site accepts the reading, so the down site ends up with gaps.
 
-### 4.4 Verify data is arriving
+### 4.5 Verify data is arriving
 
 xDrip uploads as readings come in, so expect the first object within about five minutes.
 
-In the console: `Cloud Storage` → `xdrip2gcp-test-c4278d` →
+In the console: `Cloud Storage` → the bucket named by `$XDRIP2GCP_BUCKET` →
 `cgm-data/collection=entries/dt=<today>/`. Each object is one upload batch, newline-delimited
-JSON, one reading per line.
+JSON, one reading per line. From the command line:
+
+```bash
+gcloud storage ls --recursive "$XDRIP2GCP_BUCKET_URI/cgm-data/**"
+```
 
 Faster than waiting for an object to appear, and the best way to see what the phone is actually
 doing:
@@ -441,7 +483,7 @@ Note that `gcloud functions logs read` is the obvious command here but a poor on
 second-generation functions it returns request entries with an empty message column. The script
 queries the underlying Cloud Run request logs instead.
 
-### 4.5 Things to expect
+### 4.6 Things to expect
 
 * **Objects self-delete after three days.** This is the test bucket, and its lifecycle rule
   caps cost. History will not accumulate here; that belongs to a later stage with its own
@@ -455,3 +497,63 @@ queries the underlying Cloud Run request logs instead.
   required because the function reads the secret when an instance starts.
 * This is real health data landing in a bucket with public access prevention enforced and
   uniform bucket-level access, reachable only by you and the function's runtime identity.
+
+### 4.7 Troubleshooting
+
+**`URISyntaxException: Illegal character in authority` naming an azurewebsites.net URL.**
+
+```
+java.net.URISyntaxException: Illegal character in authority at index 8:
+https://yourpassphrase@{YOUR-SITE}.azurewebsites.net/api/v1/
+```
+
+That URL is xDrip's built-in placeholder, not anything you typed. Java's URI parser rejects the
+`{` and `}` in `{YOUR-SITE}`; the reported index 8 is just where the authority component
+starts, not where the bad character is. The message means xDrip is trying to upload to the
+example value, so either the `Base URL` field was never saved, or — because xDrip accepts
+several sites in that field separated by spaces and tries each one — the field holds the
+placeholder *alongside* the real URL. In the second case the error recurs on every upload cycle
+while uploads still succeed. Fix: open `Base URL` and make sure it contains nothing but the one
+URL from 4.2.
+
+**Errors from `doRESTtreatmentDownload`.** Anything in a stack trace that mentions downloading
+means a download option is still enabled. The function is write-only, so those calls will fail
+or return 404 even once the URL is valid. Turn the download options off; uploads are unaffected.
+
+**Uploads appear to have stopped part-way through the day.** Both the console and
+`gcloud storage ls` sort objects by name. Entries now carry an epoch-millisecond prefix so that
+order is chronological, but `devicestatus` objects have hash-only names because xDrip sends no
+timestamp with them, so those still appear in arbitrary positions. `python src/show_requests.py`
+is the reliable way to see whether traffic is still arriving, and this lists objects by creation
+time regardless of naming:
+
+```bash
+gcloud storage ls --long --recursive "$XDRIP2GCP_BUCKET_URI/cgm-data/**" | sort -k2
+```
+
+### 4.8 Verified results
+
+Readings from a Dexcom G5 via a Pixel 9 Pro arrived every five minutes and were stored:
+
+```
+cgm-data/collection=entries/dt=2026-09-04/1788564814746-d11ead64a0bf55b8.ndjson
+{"date":1788564814746,"dateString":"2026-09-04T17:33:34.746-0600","delta":0,
+ "device":"xDrip-DexcomG5","direction":"Flat","filtered":0,"noise":1,"rssi":100,
+ "sgv":81,"sysTime":"2026-09-04T17:33:34.746-0600","type":"sgv","unfiltered":0}
+```
+
+The object's name prefix, `1788564814746`, is the reading's own `date`, so the listing reads in
+time order.
+
+Batch sizes vary: one upload carried two readings, the next carried one, which is why object
+names are per batch rather than per reading.
+
+128 tests pass after the naming change: 89 offline, 39 live.
+
+One thing to know for the BigQuery stage: xDrip's `devicestatus` documents look like
+`{"device":"Google Pixel 9 Pro","uploader":{"battery":100,"type":"PHONE"}}` and carry **no
+timestamp**. Content-addressed naming therefore collapses every identical status post into one
+object, so `devicestatus` records when a value *changed* rather than when it was reported. That
+is harmless for CGM readings, which each carry their own `date`, but it means device status
+cannot be used as a heartbeat. If reporting times matter later, that collection needs the
+server's receive time added before it is stored.

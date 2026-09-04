@@ -227,7 +227,7 @@ class Stage3ConfigTests(unittest.TestCase):
 
 class BucketNameValidationTests(unittest.TestCase):
     def test_accepts_valid_names(self) -> None:
-        for name in ("xdrip2gcp-test-c4278d", "abc", "a-1"):
+        for name in ("xdrip2gcp-test-a1b2c3", "abc", "a-1"):
             with self.subTest(name=name):
                 validate_bucket_name(name)
 

@@ -224,6 +224,72 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(same, again)
         self.assertNotEqual(same, different)
 
+    def test_timestamp_prefix_comes_from_the_documents(self) -> None:
+        when = datetime(2026, 9, 4, 23, 0, tzinfo=timezone.utc)
+        documents = [{"sgv": 120, "date": 1788563014367}]
+        path = core.object_path("p", "entries", when, b"payload", documents)
+        self.assertIn("/1788563014367-", path)
+
+    def test_prefix_uses_the_earliest_timestamp_in_the_batch(self) -> None:
+        when = datetime(2026, 9, 4, tzinfo=timezone.utc)
+        documents = [{"date": 1788563014367}, {"date": 1788562714367}]
+        path = core.object_path("p", "entries", when, b"payload", documents)
+        self.assertIn("/1788562714367-", path)
+
+    def test_listing_sorts_chronologically(self) -> None:
+        # The point of the prefix: alphabetical order is time order.
+        when = datetime(2026, 9, 4, tzinfo=timezone.utc)
+        earlier = core.object_path("p", "entries", when, b"first", [{"date": 1788562714367}])
+        later = core.object_path("p", "entries", when, b"second", [{"date": 1788563014367}])
+        self.assertLess(sorted([later, earlier])[0], later)
+        self.assertEqual(sorted([later, earlier]), [earlier, later])
+
+    def test_prefix_is_deterministic_so_retries_still_deduplicate(self) -> None:
+        when = datetime(2026, 9, 4, tzinfo=timezone.utc)
+        documents = [{"sgv": 120, "date": 1788563014367}]
+        first = core.object_path("p", "entries", when, b"payload", documents)
+        again = core.object_path("p", "entries", when, b"payload", documents)
+        self.assertEqual(first, again)
+
+    def test_documents_without_a_timestamp_keep_hash_only_names(self) -> None:
+        # xDrip's device status carries no timestamp at all.
+        when = datetime(2026, 9, 4, tzinfo=timezone.utc)
+        documents = [{"device": "Google Pixel 9 Pro", "uploader": {"battery": 100}}]
+        path = core.object_path("p", "devicestatus", when, b"payload", documents)
+        self.assertEqual(path, core.object_path("p", "devicestatus", when, b"payload"))
+        self.assertRegex(path.rsplit("/", 1)[-1], r"\A[0-9a-f]{16}\.ndjson\Z")
+
+    def test_timestamps_are_read_from_any_nightscout_field(self) -> None:
+        cases = {
+            "epoch milliseconds": ({"date": 1788563014367}, 1788563014367),
+            "epoch seconds": ({"date": 1788563014}, 1788563014000),
+            "numeric string": ({"date": "1788563014367"}, 1788563014367),
+            "v3 mills": ({"mills": 1788563014367}, 1788563014367),
+            "iso with offset": ({"created_at": "2026-09-04T17:03:34.367-0600"}, 1788563014367),
+            "iso with Z": ({"dateString": "2026-09-04T23:03:34.367Z"}, 1788563014367),
+            "naive iso assumed utc": ({"sysTime": "2026-09-04T23:03:34.367"}, 1788563014367),
+        }
+        for reason, (document, expected) in cases.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(core.document_timestamp_ms(document), expected)
+
+    def test_unusable_timestamps_are_ignored(self) -> None:
+        for reason, document in {
+            "missing": {"sgv": 120},
+            "empty string": {"date": ""},
+            "unparseable": {"date": "yesterday"},
+            "zero": {"date": 0},
+            "negative": {"date": -5},
+            "boolean": {"date": True},
+            "null": {"date": None},
+        }.items():
+            with self.subTest(reason=reason):
+                self.assertIsNone(core.document_timestamp_ms(document))
+
+    def test_a_later_field_is_used_when_the_first_is_unusable(self) -> None:
+        document = {"date": "", "dateString": "2026-09-04T23:03:34.367Z"}
+        self.assertEqual(core.document_timestamp_ms(document), 1788563014367)
+
     def test_collection_and_day_partition_separately(self) -> None:
         payload = b"payload"
         entries = core.object_path("p", "entries", datetime(2026, 9, 4, tzinfo=timezone.utc), payload)
@@ -278,6 +344,7 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
 
         path = response.headers["x-xdrip2gcp-object"]
+        self.assertIn("/1757000000000-", path, "the reading's own timestamp should prefix the name")
         self.assertEqual(response.headers["x-xdrip2gcp-stored"], "new")
         self.assertEqual(response.headers["x-xdrip2gcp-documents"], "1")
         self.assertIn("collection=entries", path)

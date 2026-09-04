@@ -314,17 +314,98 @@ def content_hash(data: bytes, length: int = 16) -> str:
     return hashlib.sha256(data).hexdigest()[:length]
 
 
-def object_path(prefix: str, collection: str, when: datetime, data: bytes) -> str:
+# Where Nightscout documents keep their own timestamp, most specific first.
+TIMESTAMP_FIELDS = ("date", "mills", "created_at", "sysTime", "dateString")
+
+# Epoch values below this are seconds rather than milliseconds. As
+# milliseconds this threshold is 1973, and as seconds it is far beyond any
+# plausible reading, so the two ranges cannot be confused.
+SECONDS_THRESHOLD = 10**11
+
+# Zero-padded width of an epoch-millisecond name prefix. Fixed width is what
+# makes lexicographic order match chronological order.
+TIMESTAMP_WIDTH = 13
+
+
+def _epoch_ms(value: Any) -> int | None:
+    """Read an epoch in milliseconds from a Nightscout timestamp field."""
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.lstrip("-").isdigit():
+            number = int(text)
+        else:
+            try:
+                moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            return int(moment.timestamp() * 1000)
+    else:
+        return None
+
+    if number <= 0:
+        return None
+    return number * 1000 if number < SECONDS_THRESHOLD else number
+
+
+def document_timestamp_ms(document: Mapping[str, Any]) -> int | None:
+    for field_name in TIMESTAMP_FIELDS:
+        if field_name in document:
+            timestamp = _epoch_ms(document[field_name])
+            if timestamp is not None:
+                return timestamp
+    return None
+
+
+def batch_timestamp_ms(documents: list[dict[str, Any]]) -> int | None:
+    """The earliest timestamp carried by a batch, or None if it has none."""
+    timestamps = [
+        timestamp
+        for timestamp in (document_timestamp_ms(document) for document in documents)
+        if timestamp is not None
+    ]
+    return min(timestamps) if timestamps else None
+
+
+def object_path(
+    prefix: str,
+    collection: str,
+    when: datetime,
+    data: bytes,
+    documents: list[dict[str, Any]] | None = None,
+) -> str:
     """Build the object name for a batch of documents.
 
     Hive-style `collection=`/`dt=` partitioning is directly readable by
-    BigQuery external tables. Naming the object after a hash of its own
-    contents is what makes the write idempotent: xDrip retries a queued upload
-    after an outage, and the retry resolves to the object already stored rather
-    than to a duplicate.
+    BigQuery external tables. The name itself is a hash of the object's own
+    contents, which is what makes the write idempotent: xDrip retries a queued
+    upload after an outage, and the retry resolves to the object already stored
+    rather than to a duplicate.
+
+    A hash alone sorts arbitrarily, though, which makes a bucket listing
+    useless for seeing what arrived when. So the name is prefixed with the
+    earliest timestamp the documents themselves carry. Deriving it from the
+    content rather than the clock keeps the name deterministic, so retries
+    still deduplicate, while fixed-width epoch milliseconds make an
+    alphabetical listing read chronologically. Documents with no timestamp of
+    their own, such as xDrip's device status, keep hash-only names.
     """
     day = when.astimezone(timezone.utc).strftime("%Y-%m-%d")
-    return f"{prefix.strip('/')}/collection={collection}/dt={day}/{content_hash(data)}.ndjson"
+    name = content_hash(data)
+
+    timestamp = batch_timestamp_ms(documents) if documents else None
+    if timestamp is not None:
+        name = f"{timestamp:0{TIMESTAMP_WIDTH}d}-{name}"
+
+    return f"{prefix.strip('/')}/collection={collection}/dt={day}/{name}.ndjson"
 
 
 # --------------------------------------------------------------------------
@@ -439,7 +520,7 @@ class Handler:
             return error_response(error.status, error.message)
 
         data = to_ndjson(documents)
-        path = object_path(self.object_prefix, collection, self.now(), data)
+        path = object_path(self.object_prefix, collection, self.now(), data, documents)
         created = self.writer(path, data, NDJSON_CONTENT_TYPE)
 
         # The body echoes the stored documents the way Nightscout does, so a

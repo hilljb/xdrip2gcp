@@ -58,8 +58,10 @@ def main(argv: list[str] | None = None) -> int:
         f'resource.labels.service_name="{config.function.name}"',
         'httpRequest.requestMethod!=""',
     ]
-    if args.minutes:
-        filters.append(f'timestamp>="-{args.minutes}m"')
+
+    # A time window goes through --freshness; the log filter language only
+    # accepts absolute timestamps.
+    window = [f"--freshness={args.minutes}m"] if args.minutes else []
 
     try:
         result = gcloud.run(
@@ -68,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
                 "logging",
                 "read",
                 " AND ".join(filters),
+                *window,
                 f"--limit={args.limit}",
                 "--format=table[no-heading](timestamp.date('%Y-%m-%d %H:%M:%S'),"
                 "httpRequest.status,httpRequest.requestMethod,httpRequest.requestUrl)",
