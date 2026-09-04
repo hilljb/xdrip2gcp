@@ -1,0 +1,13 @@
+# Local, machine-specific configuration: GCP project overrides and the
+# generated bucket name suffix. Never commit this; each clone makes its own.
+resources/config.local.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
