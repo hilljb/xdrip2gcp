@@ -194,6 +194,7 @@ src/xdrip2gcp/function_source.py              imports the function's core module
 src/xdrip2gcp/actions.py                      shared changed/no-op result type
 src/setup_gcp.py                              entry point: prepare the project
 src/deploy_function.py                        entry point: secret + deploy; --show-url, --force
+src/show_requests.py                          entry point: recent HTTP requests to the function
 test/test_nightscout_core.py                  offline: the whole request path
 test/test_function_live.py                    live: deployment, HTTPS behaviour, bucket contents
 ```
@@ -355,3 +356,102 @@ python -m unittest discover -s test -t . -v
   `cgm-data/collection=entries/dt=.../<hash>.ndjson`, and a repeat POST is reported as a
   duplicate with no second object.
 * 119 tests pass: 81 offline (well under a second), 38 live.
+
+## Stage 4: Send data to the test bucket from xDrip on a phone (Developer) ← In-Progress
+
+Nothing new gets built here. The Stage 3 function already speaks Nightscout's REST API, so
+xDrip needs no special treatment: it is pointed at our endpoint exactly as it would be pointed
+at a real Nightscout site.
+
+### 4.1 Get the base URL
+
+On the computer, in the repo:
+
+```bash
+conda activate xdrip2gcp
+python src/deploy_function.py --show-url
+```
+
+The second line is the string to put into xDrip, already in the format the app expects:
+
+```
+https://<password>@xdrip2gcp-nightscout-test-2r2mgszbda-uc.a.run.app/api/v1/
+```
+
+The password is 32 URL-safe characters (letters, digits, `-` and `_` only), so it needs no
+escaping and can be typed or pasted verbatim. It is the only thing guarding a publicly
+reachable endpoint, so treat it like any other password: a password manager's secure note is a
+good way to move it to the phone, and it should not be pasted anywhere it persists in
+plaintext, such as a chat app or email to yourself.
+
+### 4.2 Confirm the endpoint works before touching the phone
+
+```bash
+python -m unittest test.test_function_live
+```
+
+That exercises authentication and a real write end to end. If those pass, any failure on the
+phone is a configuration problem in xDrip, not a problem with the function.
+
+### 4.3 Configure xDrip
+
+1. `Settings` → `Cloud Upload` → `Nightscout Sync (REST-API)`.
+2. Enable the feature with the toggle at the top of that page.
+3. Tap `Base URL` and enter the whole string from 4.1, including the trailing `/api/v1/`.
+4. Leave anything that *downloads* from Nightscout switched off. The function is write-only by
+   design, so following or backfilling from it will not work. In particular, do not also set
+   `Settings` → `Hardware Data Source` → `Nightscout Follower`.
+5. Uploading treatments and device status is fine to leave on; `/api/v1/treatments` and
+   `/api/v1/devicestatus` both exist and are stored in their own partitions.
+
+xDrip accepts several sites in the `Base URL` field separated by spaces. Worth knowing if you
+also upload to a real Nightscout: when one site is down, xDrip clears its queue as soon as
+*any* site accepts the reading, so the down site ends up with gaps.
+
+### 4.4 Verify data is arriving
+
+xDrip uploads as readings come in, so expect the first object within about five minutes.
+
+In the console: `Cloud Storage` → `xdrip2gcp-test-c4278d` →
+`cgm-data/collection=entries/dt=<today>/`. Each object is one upload batch, newline-delimited
+JSON, one reading per line.
+
+Faster than waiting for an object to appear, and the best way to see what the phone is actually
+doing:
+
+```bash
+python src/show_requests.py                  # recent requests
+python src/show_requests.py --minutes 10     # just the last ten minutes
+```
+
+```
+TIME (UTC)           STATUS  METHOD  PATH
+2026-09-04 22:01:53  200     POST    /api/v1/entries
+2026-09-04 22:01:56  401     POST    /api/v1/entries
+```
+
+* `200` — accepted and written.
+* `401` — the password in the base URL does not match; re-check it for a typo or a stale value.
+* `404` or `405` — xDrip probed an endpoint the function does not implement. Harmless; uploads
+  still work. If it turns out to be noisy, the read endpoints can be added.
+* No requests at all — xDrip is not reaching the endpoint. Check that the feature toggle is on
+  and the URL ends with `/api/v1/`.
+
+Note that `gcloud functions logs read` is the obvious command here but a poor one: for
+second-generation functions it returns request entries with an empty message column. The script
+queries the underlying Cloud Run request logs instead.
+
+### 4.5 Things to expect
+
+* **Objects self-delete after three days.** This is the test bucket, and its lifecycle rule
+  caps cost. History will not accumulate here; that belongs to a later stage with its own
+  bucket and a BigQuery table.
+* **Retries do not duplicate.** xDrip queues readings when the endpoint is unreachable and
+  uploads them later. Because object names are a hash of their contents, a re-sent batch
+  resolves to the object already stored.
+* **Rotating the password:** change `[auth] password` in `resources/config.local.toml` (or
+  delete the line to have a fresh one generated), run `python src/deploy_function.py` to store
+  a new secret version and redeploy, then update the `Base URL` on the phone. The redeploy is
+  required because the function reads the secret when an instance starts.
+* This is real health data landing in a bucket with public access prevention enforced and
+  uniform bucket-level access, reachable only by you and the function's runtime identity.
