@@ -6,14 +6,16 @@ Settings come from three layers, each overriding the one before it:
 2. `resources/config.local.toml` - per-machine overrides, git-ignored.
 3. `XDRIP2GCP_*` environment variables.
 
-The bucket name gets special treatment. Cloud Storage bucket names are globally
-unique, so the name is `<base_name>-<name_suffix>` with a suffix generated once
-and persisted to the local config file. That keeps runs idempotent: the first
-run picks a name, every later run resolves to the same one.
+Two values are generated rather than configured, and both are persisted to the
+local config file so that later runs resolve to the same thing: the bucket name
+suffix (bucket names are globally unique) and the Nightscout password. Writing
+them down is what makes repeated runs idempotent instead of creating a new
+bucket or invalidating the deployed secret every time.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import secrets
@@ -47,6 +49,51 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
+class ServiceAccountConfig:
+    """Dedicated identities for building and running the function."""
+
+    runtime_id: str
+    build_id: str
+    runtime_role_bucket: str
+    build_role_project: str
+
+
+@dataclass(frozen=True)
+class FunctionConfig:
+    """Cloud Function deployment settings."""
+
+    name: str
+    region: str
+    runtime: str
+    entry_point: str
+    source_dir: str
+    memory: str
+    timeout_seconds: int
+    max_instances: int
+    allow_unauthenticated: bool
+
+    @property
+    def source_path(self) -> Path:
+        return REPO_ROOT / self.source_dir
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    """Nightscout credential settings and scrypt work factors."""
+
+    header_name: str
+    secret_id: str
+    password: str
+    password_bytes: int
+    scrypt_n: int
+    scrypt_r: int
+    scrypt_p: int
+    scrypt_dklen: int
+    salt_bytes: int
+    max_request_bytes: int
+
+
+@dataclass(frozen=True)
 class Config:
     """Resolved, validated configuration."""
 
@@ -62,6 +109,10 @@ class Config:
     test_data: dict[str, Any] = field(default_factory=dict)
     cloudsdk_python: str = ""
     gcloud_timeout_seconds: int = 120
+    services: tuple[str, ...] = ()
+    service_accounts: ServiceAccountConfig | None = None
+    function: FunctionConfig | None = None
+    auth: AuthConfig | None = None
 
     @property
     def bucket_uri(self) -> str:
@@ -69,6 +120,34 @@ class Config:
 
     def test_object_uri(self, name: str) -> str:
         return f"{self.bucket_uri}/{self.test_prefix}/{name}"
+
+    @property
+    def function_region(self) -> str:
+        """Where the function is deployed, defaulting to the bucket's location."""
+        if self.function is not None and self.function.region:
+            return self.function.region
+        return self.location
+
+    def service_account_email(self, account_id: str) -> str:
+        return f"{account_id}@{self.project_id}.iam.gserviceaccount.com"
+
+    @property
+    def runtime_service_account(self) -> str:
+        if self.service_accounts is None:
+            raise ConfigError("[service_accounts] is missing from the configuration")
+        return self.service_account_email(self.service_accounts.runtime_id)
+
+    @property
+    def build_service_account(self) -> str:
+        if self.service_accounts is None:
+            raise ConfigError("[service_accounts] is missing from the configuration")
+        return self.service_account_email(self.service_accounts.build_id)
+
+    @property
+    def secret_resource(self) -> str:
+        if self.auth is None:
+            raise ConfigError("[auth] is missing from the configuration")
+        return f"projects/{self.project_id}/secrets/{self.auth.secret_id}"
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -101,37 +180,48 @@ def _quote_toml(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _persist_bucket_suffix(suffix: str, path: Path) -> None:
-    """Record a generated bucket suffix so later runs reuse the same bucket.
+LOCAL_CONFIG_HEADER = (
+    "# xdrip2gcp local configuration (git-ignored).\n"
+    "# Overrides resources/config.toml. Machine- and account-specific values live here.\n"
+)
 
-    Only ever appends to a `[bucket]` table, and only when no suffix is
-    recorded yet, so hand-written values in the local config are left alone.
+
+def _section_span(text: str, section: str) -> tuple[int, int] | None:
+    """Locate a TOML table's body, as (start, end) offsets into `text`."""
+    header = re.search(rf"^[ \t]*\[{re.escape(section)}\][ \t]*$", text, flags=re.MULTILINE)
+    if header is None:
+        return None
+    next_header = re.search(r"^[ \t]*\[", text[header.end() :], flags=re.MULTILINE)
+    end = header.end() + next_header.start() if next_header else len(text)
+    return header.end(), end
+
+
+def _persist_local_setting(path: Path, section: str, key: str, value: str) -> None:
+    """Record a generated value in the local config file.
+
+    Edits by insertion rather than rewriting the file, so comments and any
+    hand-written settings survive, and never touches a key that is already
+    present in the target table.
     """
-    existing = path.read_text() if path.exists() else ""
-    if re.search(r"^\s*name_suffix\s*=", existing, flags=re.MULTILINE):
+    if not path.exists():
+        path.write_text(f"{LOCAL_CONFIG_HEADER}\n[{section}]\n{key} = {_quote_toml(value)}\n")
         return
 
-    if not existing:
-        header = (
-            "# xdrip2gcp local configuration (git-ignored).\n"
-            "# Overrides resources/config.toml. Machine- and account-specific values live here.\n\n"
-        )
-        body = f"[bucket]\nname_suffix = {_quote_toml(suffix)}\n"
-        path.write_text(header + body)
+    text = path.read_text()
+    if not text.endswith("\n"):
+        text += "\n"
+
+    span = _section_span(text, section)
+    if span is None:
+        path.write_text(f"{text}\n[{section}]\n{key} = {_quote_toml(value)}\n")
         return
 
-    text = existing if existing.endswith("\n") else existing + "\n"
-    if re.search(r"^\s*\[bucket\]\s*$", text, flags=re.MULTILINE):
-        text = re.sub(
-            r"^(\s*\[bucket\]\s*)$",
-            lambda match: f"{match.group(1)}\nname_suffix = {_quote_toml(suffix)}",
-            text,
-            count=1,
-            flags=re.MULTILINE,
-        )
-    else:
-        text += f"\n[bucket]\nname_suffix = {_quote_toml(suffix)}\n"
-    path.write_text(text)
+    start, end = span
+    if re.search(rf"^[ \t]*{re.escape(key)}[ \t]*=", text[start:end], flags=re.MULTILINE):
+        return
+
+    line = f"{key} = {_quote_toml(value)}\n"
+    path.write_text(text[:start] + "\n" + line + text[start:].lstrip("\n"))
 
 
 def validate_bucket_name(name: str) -> None:
@@ -185,7 +275,7 @@ def load_config(
     shared_path: Path = SHARED_CONFIG_PATH,
     local_path: Path = LOCAL_CONFIG_PATH,
     *,
-    allow_suffix_generation: bool = True,
+    allow_generation: bool = True,
 ) -> Config:
     """Load, merge and validate configuration into a `Config`."""
     if not shared_path.exists():
@@ -199,6 +289,10 @@ def load_config(
     objects = raw.get("objects", {})
     test_data = raw.get("test_data", {})
     gcloud_settings = raw.get("gcloud", {})
+    gcp = raw.get("gcp", {})
+    accounts = raw.get("service_accounts", {})
+    function = raw.get("function", {})
+    auth = raw.get("auth", {})
 
     project_id = str(project.get("id", "")).strip()
     if not project_id:
@@ -211,12 +305,12 @@ def load_config(
             raise ConfigError("[bucket].base_name is required when [bucket].name is empty")
         suffix = str(bucket.get("name_suffix", "")).strip()
         if not suffix:
-            if not allow_suffix_generation:
+            if not allow_generation:
                 raise ConfigError(
                     "no bucket name suffix recorded; run src/create_bucket.py to generate one"
                 )
             suffix = secrets.token_hex(SUFFIX_BYTES)
-            _persist_bucket_suffix(suffix, local_path)
+            _persist_local_setting(local_path, "bucket", "name_suffix", suffix)
         bucket_name = f"{base_name}-{suffix}"
 
     validate_bucket_name(bucket_name)
@@ -242,4 +336,53 @@ def load_config(
         test_data=dict(test_data),
         cloudsdk_python=resolve_cloudsdk_python(str(gcloud_settings.get("cloudsdk_python", ""))),
         gcloud_timeout_seconds=int(gcloud_settings.get("timeout_seconds", 120)),
+        services=tuple(str(name) for name in gcp.get("services", ())),
+        service_accounts=ServiceAccountConfig(
+            runtime_id=str(accounts.get("runtime_id", "xdrip2gcp-fn-runtime")),
+            build_id=str(accounts.get("build_id", "xdrip2gcp-fn-build")),
+            runtime_role_bucket=str(accounts.get("runtime_role_bucket", "roles/storage.objectCreator")),
+            build_role_project=str(accounts.get("build_role_project", "roles/cloudbuild.builds.builder")),
+        ),
+        function=FunctionConfig(
+            name=str(function.get("name", "xdrip2gcp-nightscout-test")),
+            region=str(function.get("region", "")).strip(),
+            runtime=str(function.get("runtime", "python314")),
+            entry_point=str(function.get("entry_point", "nightscout")),
+            source_dir=str(function.get("source_dir", "src/functions/nightscout")),
+            memory=str(function.get("memory", "256Mi")),
+            timeout_seconds=int(function.get("timeout_seconds", 60)),
+            max_instances=int(function.get("max_instances", 3)),
+            allow_unauthenticated=bool(function.get("allow_unauthenticated", True)),
+        ),
+        auth=AuthConfig(
+            header_name=str(auth.get("header_name", "api-secret")),
+            secret_id=str(auth.get("secret_id", "xdrip2gcp-nightscout-api-secret")),
+            password=str(auth.get("password", "")).strip(),
+            password_bytes=int(auth.get("password_bytes", 24)),
+            scrypt_n=int(auth.get("scrypt_n", 16384)),
+            scrypt_r=int(auth.get("scrypt_r", 8)),
+            scrypt_p=int(auth.get("scrypt_p", 1)),
+            scrypt_dklen=int(auth.get("scrypt_dklen", 32)),
+            salt_bytes=int(auth.get("salt_bytes", 16)),
+            max_request_bytes=int(auth.get("max_request_bytes", 1048576)),
+        ),
     )
+
+
+def ensure_password(config: Config, local_path: Path = LOCAL_CONFIG_PATH) -> tuple[Config, bool]:
+    """Return a config that has a Nightscout password, generating one if needed.
+
+    Generation is deliberately not part of `load_config`: the password is only
+    needed when deploying or authenticating, and a generated one must be
+    recorded before the deployed secret depends on it. The alphabet is URL-safe
+    so the password can go straight into xDrip's `https://password@host/api/v1/`
+    setting without escaping.
+    """
+    if config.auth is None:
+        raise ConfigError("[auth] is missing from the configuration")
+    if config.auth.password:
+        return config, False
+
+    password = secrets.token_urlsafe(config.auth.password_bytes)
+    _persist_local_setting(local_path, "auth", "password", password)
+    return dataclasses.replace(config, auth=dataclasses.replace(config.auth, password=password)), True

@@ -155,4 +155,203 @@ suite without a GCP account.
 * A second `create_bucket.py` run reports both steps as no-ops.
 * `test-data/hello.txt` (92 bytes) and `test-data/sample.json` (500 bytes) write, verify, and
   re-write as no-ops.
-* 36 tests pass: 21 offline, 15 live.
+* 36 tests pass: 21 offline, 15 live. (Stage 3 grew these totals; see 3.9.)
+
+## Stage 3: Create a test GCP function (Agent) ✓ Done
+
+What this stage built:
+
+* A Python HTTP Cloud Function (2nd gen), deployed from this repo with the `gcloud` cli.
+* Nightscout-style endpoints: `POST /api/v1/{entries,treatments,devicestatus}` and
+  `GET /api/v1/status`, so a Nightscout client can talk to it unmodified.
+* Posted documents are written into the Stage 2 test bucket as newline-delimited JSON, and
+  tests read them back out to verify them.
+* Authentication with a password we hold locally and GCP only ever sees hashed:
+    * A Nightscout client sends `sha1(password)` in an `api-secret` header — that is the
+      protocol, and it means the plaintext password never crosses the wire.
+    * The function hashes that received value again with salted scrypt and compares it, in
+      constant time, against a digest stored in Secret Manager.
+    * So the plaintext lives only in `resources/config.local.toml` (git-ignored, and the value
+      typed into xDrip), while GCP holds a digest that cannot be replayed against the endpoint
+      even if it leaks.
+* All of it is testable locally and idempotent: re-running the setup and deploy scripts reports
+  no-ops, and re-posting the same readings does not create a duplicate object.
+
+Still no new local dependencies. The deployed function has its own `requirements.txt`
+(`functions-framework`, `google-cloud-storage`), but nothing was added to the conda
+environment: the offline tests drive stdlib-only code, and the live tests use `urllib`.
+
+### 3.1 Layout
+
+```
+src/functions/nightscout/main.py              thin Flask-to-core adapter (deployed)
+src/functions/nightscout/nightscout_core.py   stdlib-only request handling (deployed + tested locally)
+src/functions/nightscout/requirements.txt     the function's own dependencies
+src/xdrip2gcp/provision.py                    APIs, service accounts, IAM
+src/xdrip2gcp/secretmanager.py                credential digest storage
+src/xdrip2gcp/cloudfunction.py                deployment and the redeploy-skip hash
+src/xdrip2gcp/function_source.py              imports the function's core module locally
+src/xdrip2gcp/actions.py                      shared changed/no-op result type
+src/setup_gcp.py                              entry point: prepare the project
+src/deploy_function.py                        entry point: secret + deploy; --show-url, --force
+test/test_nightscout_core.py                  offline: the whole request path
+test/test_function_live.py                    live: deployment, HTTPS behaviour, bucket contents
+```
+
+### 3.2 Authentication: what Nightscout actually sends
+
+This stage was originally specified as "the request sends a password as the Nightscout API
+expects, and the function hashes it". Those two halves need reconciling, because **a Nightscout
+client never sends the plaintext password**. Both the Nightscout server implementation and
+xDrip's own docs confirm
+the client computes `sha1(password)` and sends the 40-character hex digest in an `api-secret`
+header. xDrip's `https://password@hostname/api/v1/` setting is hashed on the phone before the
+request leaves it.
+
+So the function applies a *second* hash, which is the useful version of the requirement:
+
+1. The plaintext password lives in `resources/config.local.toml` (git-ignored). This is the
+   value typed into xDrip.
+2. Secret Manager holds a self-describing JSON document:
+   `{"algorithm":"scrypt","credential_hash":"sha1","n":...,"r":...,"p":...,"salt":...,"digest":...}`,
+   where the digest covers `sha1_hex(password)` with a random salt.
+3. The function hashes the received header value with scrypt and compares using
+   `hmac.compare_digest` for constant time.
+
+Consequences worth knowing:
+
+* GCP never holds anything replayable. Leaking the stored digest does not let an attacker
+  authenticate, since they would still need the SHA-1 preimage.
+* Storing the work factors *alongside* the digest means they can be raised later without the
+  function having to guess which scheme an older secret version used.
+* Nightscout's SHA-1 is unsalted, so a weak password could be reversed from an intercepted
+  header via rainbow tables. The password is therefore generated (`secrets.token_urlsafe`)
+  rather than chosen, from a URL-safe alphabet so it drops into xDrip's URL without escaping.
+* Credentials are accepted from the `api-secret` header, HTTP Basic auth, and a `?secret=` or
+  `?token=` query parameter, because xDrip carries the password as URL userinfo and some HTTP
+  stacks convert that to Basic auth. A 40-character hex value is treated as a digest; anything
+  else is treated as plaintext and hashed first, so `curl -H 'api-secret: <password>'` works
+  for hand testing.
+
+### 3.3 Endpoints
+
+Routing matches on the `/api/v1/` marker anywhere in the path, so the same code serves both
+URL styles (see 3.5).
+
+| Endpoint | Auth | Behaviour |
+| --- | --- | --- |
+| `GET /api/v1/status[.json]` | none | Nightscout-shaped health JSON; real Nightscout leaves this open and clients use it as a reachability check |
+| `GET /api/v1/experiments/test` | required | authorization check, as Nightscout uploaders use |
+| `POST /api/v1/entries[.json]` | required | stores CGM readings |
+| `POST /api/v1/treatments[.json]` | required | stores treatments |
+| `POST /api/v1/devicestatus[.json]` | required | stores device telemetry |
+
+Anything else is a 404 that lists the supported endpoints; a wrong method is a 405.
+Authentication is checked *before* the payload is parsed, so an unauthenticated caller learns
+nothing about payload validation. Successful writes return the stored documents the way
+Nightscout does, keeping the body protocol-faithful, and put our own metadata in
+`x-xdrip2gcp-*` response headers where tests can assert on it.
+
+### 3.4 Storage layout and data-path idempotency
+
+Objects are written as newline-delimited JSON at:
+
+```
+cgm-data/collection=entries/dt=2026-09-04/<sha256-of-contents>.ndjson
+```
+
+* **NDJSON** because BigQuery ingests it natively, and BigQuery is the end goal.
+* **Hive-style `collection=`/`dt=` partitioning** so a BigQuery external table can read the
+  layout directly with no reshaping later.
+* **Content-addressed names**, with keys sorted during serialization so the bytes are
+  canonical. xDrip queues readings during an outage and retries, so the same batch can arrive
+  twice; the retry resolves to the object already stored rather than a duplicate. A client that
+  reorders JSON keys still produces the same object.
+* The function uploads with `if_generation_match=0`, meaning "only if absent", so a duplicate
+  is rejected by Cloud Storage rather than overwritten and the response reports
+  `x-xdrip2gcp-stored: duplicate`. This is also why the runtime identity needs only
+  `roles/storage.objectCreator` and holds no delete permission anywhere.
+
+### 3.5 Deployment
+
+`src/setup_gcp.py` enables six APIs and creates two dedicated service accounts. `compute` is
+among the APIs because gen2 functions build through Cloud Build, whose default identity is the
+Compute Engine default service account — on a fresh project that account does not exist yet,
+which produces confusing failures. Both accounts are passed explicitly (`--service-account`,
+`--build-service-account`) rather than relying on defaults:
+
+* `xdrip2gcp-fn-build` holds `roles/cloudbuild.builds.builder` on the project.
+* `xdrip2gcp-fn-runtime` holds `roles/storage.objectCreator` **on the bucket only** and
+  `roles/secretmanager.secretAccessor` **on the one secret only**. It has no project-wide role.
+
+`src/deploy_function.py` generates the password if needed, converges the secret, and deploys.
+The function is deployed to `us-central1` to match the bucket, capped at 3 instances with a
+60-second timeout, and reachable unauthenticated — necessary for a phone, with the api-secret
+as the actual guard.
+
+The endpoint uses the Cloud Run URL (`https://<name>-<hash>-uc.a.run.app`) rather than the
+`cloudfunctions.net` alias, so the path is exactly `/api/v1/entries` and xDrip's base URL
+format lines up. `python src/deploy_function.py --show-url` prints the ready-made xDrip URL for
+Stage 4.
+
+### 3.6 Idempotency
+
+* **APIs, service accounts, IAM bindings and the secret** are all checked before acting; a
+  second `setup_gcp.py` or `deploy_function.py` run reports every step as a no-op.
+* **Secret versions** are only added when the stored digest fails to verify against the local
+  password, or when the scrypt parameters changed. Versions cost money and cannot be edited, so
+  re-deploying must not mint one each time.
+* **Deployment** is skipped when nothing changed. The function carries a `source-hash` label
+  covering the source tree, every deploy setting, and a fingerprint of the stored credential.
+  The credential is part of it because secret environment variables resolve at instance
+  startup, so rotating the password requires a redeploy to take effect — folding the digest
+  into the hash makes that automatic. `--force` overrides. Skipping turns a 90-second rebuild
+  into a 9-second check.
+* **A fresh service account** is not immediately visible to the IAM policy APIs, so bindings
+  retry with a delay rather than failing on a propagation race.
+
+### 3.7 Testing
+
+`nightscout_core.py` has no cloud imports and takes its storage writer as an injected callable,
+so the offline tests drive the entire request path against a fake writer that reproduces Cloud
+Storage's create-only semantics. That covers routing, all three credential locations, digest
+versus plaintext detection, scrypt verify and reject, payload validation and size limits,
+canonical serialization, and duplicate detection — with no dependencies and in under a tenth of
+a second.
+
+`test_function_live.py` then checks the real thing over HTTPS: that the deployment matches
+config and runs as the least-privilege identity, that the stored digest contains no replayable
+credential but does verify the local password, that all four credential styles authenticate and
+wrong ones get 401 with nothing written, that status codes are right for bad methods, unknown
+paths and malformed payloads, and that a posted batch lands in the bucket as NDJSON with the
+right content type and re-posting is recognized as a duplicate. It deletes the objects it
+creates.
+
+```bash
+conda activate xdrip2gcp
+python src/setup_gcp.py                      # APIs, service accounts, IAM; --dry-run to inspect
+python src/deploy_function.py                # secret + deploy; --force to redeploy anyway
+python src/deploy_function.py --show-url     # the endpoint, and the xDrip base URL
+python -m unittest discover -s test -t . -v
+```
+
+### 3.8 Notes and gotchas found along the way
+
+* **A brand-new project has no service accounts at all** and none of the needed APIs. The
+  Compute API in particular has to be on before a gen2 function can build.
+* **`python314` is available for gen2 functions**, which matches the conda environment, so the
+  offline tests exercise the same language version the deployed function runs.
+* Cloud Storage's `if_generation_match=0` precondition turned out to remove the need for delete
+  permission entirely, which is stricter than the least-privilege plan started out being.
+* `urllib`'s `HTTPError` is itself a response object holding an open socket; not closing it
+  makes `ResourceWarning`s appear mid-test-run.
+
+### 3.9 Verified results
+
+* Function `xdrip2gcp-nightscout-test` is ACTIVE in `us-central1` on `python314`, running as
+  `xdrip2gcp-fn-runtime`, at `https://xdrip2gcp-nightscout-test-2r2mgszbda-uc.a.run.app`.
+* First deploy took 88 seconds; a second run skips it in 9 and reports no-ops throughout.
+* Nightscout-shaped entries POST successfully, land as NDJSON under
+  `cgm-data/collection=entries/dt=.../<hash>.ndjson`, and a repeat POST is reported as a
+  duplicate with no second object.
+* 119 tests pass: 81 offline (well under a second), 38 live.

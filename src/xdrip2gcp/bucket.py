@@ -12,27 +12,16 @@ import base64
 import hashlib
 import json
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .actions import ActionResult
 from .config import Config
 from .gcloud import GcloudError, run
 
 
 class BucketOwnedElsewhereError(Exception):
     """Raised when the bucket name exists but belongs to another project."""
-
-
-@dataclass(frozen=True)
-class ActionResult:
-    """What an idempotent operation actually did."""
-
-    changed: bool
-    detail: str
-
-    def __str__(self) -> str:
-        return self.detail
 
 
 def _object_uri(config: Config, object_path: str) -> str:

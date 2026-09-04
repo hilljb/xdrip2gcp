@@ -63,8 +63,13 @@ def run(
     *,
     check: bool = True,
     stdin_bytes: bytes | None = None,
+    timeout: int | None = None,
 ) -> GcloudResult:
-    """Run `gcloud <args>` with the project and interpreter already set."""
+    """Run `gcloud <args>` with the project and interpreter already set.
+
+    `timeout` overrides the configured default for the slow operations, like a
+    function deployment that has to build a container image.
+    """
     command = ["gcloud", *args]
     if not any(arg.startswith("--project") for arg in args):
         command.append(f"--project={config.project_id}")
@@ -74,7 +79,7 @@ def run(
         input=stdin_bytes,
         capture_output=True,
         env=build_env(config),
-        timeout=config.gcloud_timeout_seconds,
+        timeout=timeout or config.gcloud_timeout_seconds,
         check=False,
     )
     result = GcloudResult(

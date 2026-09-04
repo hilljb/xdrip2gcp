@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import unittest
+from datetime import datetime
 
 from xdrip2gcp import testdata
 from xdrip2gcp.config import Config
@@ -24,6 +25,9 @@ CONFIG = Config(
         "random_seed": 99,
         "text_object": "hello.txt",
         "json_object": "sample.json",
+        "entry_count": 3,
+        "entry_base_ms": 1757000000000,
+        "entry_interval_ms": 300000,
     },
     cloudsdk_python="/usr/bin/python3",
 )
@@ -69,3 +73,36 @@ class TestDataGenerationTests(unittest.TestCase):
         for payload in testdata.all_payloads(CONFIG):
             path = testdata.object_path(CONFIG, payload)
             self.assertTrue(path.startswith("test-data/"), path)
+
+
+class NightscoutEntryTests(unittest.TestCase):
+    """CGM readings shaped the way xDrip uploads them."""
+
+    def test_entries_carry_the_nightscout_fields(self) -> None:
+        for entry in testdata.nightscout_entries(CONFIG):
+            self.assertEqual(entry["type"], "sgv")
+            self.assertIn("date", entry)
+            self.assertIn("dateString", entry)
+            self.assertIn("direction", entry)
+            self.assertIn("device", entry)
+            self.assertGreaterEqual(entry["sgv"], 70)
+            self.assertLessEqual(entry["sgv"], 180)
+
+    def test_entry_count_follows_config(self) -> None:
+        self.assertEqual(len(testdata.nightscout_entries(CONFIG)), 3)
+
+    def test_generation_is_deterministic(self) -> None:
+        # A byte-identical batch is what makes the function's duplicate
+        # detection testable and the object name predictable.
+        self.assertEqual(testdata.nightscout_entries(CONFIG), testdata.nightscout_entries(CONFIG))
+
+    def test_timestamps_are_evenly_spaced_from_the_configured_base(self) -> None:
+        entries = testdata.nightscout_entries(CONFIG)
+        self.assertEqual(entries[0]["date"], 1757000000000)
+        gaps = {second["date"] - first["date"] for first, second in zip(entries, entries[1:])}
+        self.assertEqual(gaps, {300000})
+
+    def test_date_string_matches_the_epoch_timestamp(self) -> None:
+        entry = testdata.nightscout_entries(CONFIG)[0]
+        parsed = datetime.fromisoformat(entry["dateString"].replace("Z", "+00:00"))
+        self.assertEqual(int(parsed.timestamp() * 1000), entry["date"])

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from xdrip2gcp import config as config_module
-from xdrip2gcp.config import ConfigError, load_config, validate_bucket_name
+from xdrip2gcp.config import ConfigError, ensure_password, load_config, validate_bucket_name
 
 SHARED_TOML = """
 [project]
@@ -37,6 +37,23 @@ json_object = "sample.json"
 [gcloud]
 cloudsdk_python = ""
 timeout_seconds = 120
+
+[gcp]
+services = ["run.googleapis.com"]
+
+[service_accounts]
+runtime_id = "fn-runtime"
+build_id = "fn-build"
+
+[function]
+name = "test-function"
+region = ""
+runtime = "python314"
+
+[auth]
+secret_id = "test-secret"
+password = ""
+password_bytes = 24
 """
 
 
@@ -101,7 +118,7 @@ class ConfigLoadingTests(unittest.TestCase):
 
     def test_suffix_generation_can_be_refused(self) -> None:
         with self.assertRaises(ConfigError):
-            self.load(allow_suffix_generation=False)
+            self.load(allow_generation=False)
         self.assertFalse(
             self.local_path.exists(),
             "refusing to generate a suffix must not write a local config file",
@@ -134,6 +151,78 @@ class ConfigLoadingTests(unittest.TestCase):
             config.test_object_uri("hello.txt"),
             "gs://explicit-bucket/test-data/hello.txt",
         )
+
+
+class Stage3ConfigTests(unittest.TestCase):
+    """Function, identity and credential settings."""
+
+    def setUp(self) -> None:
+        self._workdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._workdir.cleanup)
+        root = Path(self._workdir.name)
+        self.shared_path = root / "config.toml"
+        self.local_path = root / "config.local.toml"
+        self.shared_path.write_text(SHARED_TOML)
+        self.local_path.write_text('[bucket]\nname = "explicit-bucket"\n')
+
+    def load(self):
+        return load_config(self.shared_path, self.local_path)
+
+    def test_function_region_falls_back_to_the_bucket_location(self) -> None:
+        # Keeping the function beside its bucket avoids cross-region egress.
+        config = self.load()
+        self.assertEqual(config.function.region, "")
+        self.assertEqual(config.function_region, config.location)
+
+    def test_explicit_function_region_wins(self) -> None:
+        self.shared_path.write_text(SHARED_TOML.replace('region = ""', 'region = "us-east1"'))
+        self.assertEqual(self.load().function_region, "us-east1")
+
+    def test_service_account_emails_are_derived_from_the_project(self) -> None:
+        config = self.load()
+        self.assertEqual(config.runtime_service_account, "fn-runtime@shared-project.iam.gserviceaccount.com")
+        self.assertEqual(config.build_service_account, "fn-build@shared-project.iam.gserviceaccount.com")
+
+    def test_secret_resource_path(self) -> None:
+        self.assertEqual(self.load().secret_resource, "projects/shared-project/secrets/test-secret")
+
+    def test_password_is_generated_once_and_reused(self) -> None:
+        first, generated = ensure_password(self.load(), self.local_path)
+        self.assertTrue(generated)
+        self.assertTrue(first.auth.password)
+
+        second, generated_again = ensure_password(self.load(), self.local_path)
+        self.assertFalse(generated_again, "a recorded password must not be regenerated")
+        self.assertEqual(first.auth.password, second.auth.password)
+
+    def test_generated_password_is_safe_in_an_xdrip_url(self) -> None:
+        # xDrip takes https://password@host/api/v1/, so these would break parsing.
+        config, _ = ensure_password(self.load(), self.local_path)
+        for character in "@/:?#":
+            self.assertNotIn(character, config.auth.password)
+
+    def test_persisting_a_value_preserves_existing_local_settings(self) -> None:
+        self.local_path.write_text(
+            "# my notes\n[bucket]\nname = \"explicit-bucket\"\n\n[project]\nid = \"local-project\"\n"
+        )
+        ensure_password(self.load(), self.local_path)
+
+        text = self.local_path.read_text()
+        self.assertIn("# my notes", text)
+        self.assertIn('name = "explicit-bucket"', text)
+        self.assertIn('id = "local-project"', text)
+        self.assertIn("[auth]", text)
+        self.assertTrue(self.load().auth.password, "the new value must be readable back")
+
+    def test_persisting_into_an_existing_section_does_not_duplicate_it(self) -> None:
+        self.local_path.write_text('[auth]\nsecret_id = "custom-secret"\n')
+        ensure_password(self.load(), self.local_path)
+
+        text = self.local_path.read_text()
+        self.assertEqual(text.count("[auth]"), 1)
+        config = self.load()
+        self.assertEqual(config.auth.secret_id, "custom-secret")
+        self.assertTrue(config.auth.password)
 
 
 class BucketNameValidationTests(unittest.TestCase):

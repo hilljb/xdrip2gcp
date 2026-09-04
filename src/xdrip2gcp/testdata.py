@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .config import Config
 
@@ -60,6 +61,46 @@ def json_payload(config: Config) -> TestPayload:
 
 def all_payloads(config: Config) -> list[TestPayload]:
     return [text_payload(config), json_payload(config)]
+
+
+# Nightscout's direction vocabulary, as xDrip sends it.
+DIRECTIONS = ("Flat", "FortyFiveUp", "SingleUp", "FortyFiveDown", "SingleDown")
+
+
+def nightscout_entries(config: Config) -> list[dict]:
+    """Generate CGM readings shaped like xDrip's `/api/v1/entries` uploads.
+
+    Timestamps come from a fixed base rather than the current clock, so the
+    serialized batch is byte-identical between runs. That is what lets a test
+    predict the content-addressed object name and assert that re-posting the
+    same batch is recognized as a duplicate.
+    """
+    count = int(config.test_data.get("entry_count", 3))
+    base_ms = int(config.test_data.get("entry_base_ms", 1757000000000))
+    interval_ms = int(config.test_data.get("entry_interval_ms", 300000))
+    rng = random.Random(int(config.test_data.get("random_seed", 0)))
+
+    entries = []
+    for index in range(count):
+        timestamp_ms = base_ms + index * interval_ms
+        entries.append(
+            {
+                "device": "xDrip-xdrip2gcp-test",
+                "date": timestamp_ms,
+                "dateString": _iso_utc(timestamp_ms),
+                "sgv": rng.randint(70, 180),
+                "direction": DIRECTIONS[index % len(DIRECTIONS)],
+                "type": "sgv",
+                "noise": 1,
+                "sysTime": _iso_utc(timestamp_ms),
+            }
+        )
+    return entries
+
+
+def _iso_utc(timestamp_ms: int) -> str:
+    moment = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def object_path(config: Config, payload: TestPayload) -> str:

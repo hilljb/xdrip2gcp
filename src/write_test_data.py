@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        config = load_config(allow_suffix_generation=False)
+        config = load_config(allow_generation=False)
     except ConfigError as error:
         print(f"configuration error: {error}", file=sys.stderr)
         return 2
