@@ -1,0 +1,6 @@
+# Keep the uploaded source to just the function itself. Anything excluded here
+# is also excluded from the deploy source hash, so local caches cannot cause a
+# spurious redeploy.
+__pycache__/
+*.py[cod]
+.DS_Store

@@ -1,0 +1,124 @@
+# xdrip2gcp configuration (shared defaults)
+#
+# This file is committed to the repo and holds the settings everyone shares.
+# Anything specific to your own GCP setup belongs in `resources/config.local.toml`,
+# which is git-ignored and overrides the values here key by key. Environment
+# variables override both; see `src/xdrip2gcp/config.py` for the full list.
+
+[project]
+# GCP project ID (not the display name). Override per-machine if yours differs.
+id = "xdrip2gcp"
+
+[bucket]
+# The bucket's full name is "<base_name>-<name_suffix>". Cloud Storage bucket
+# names share one global namespace, so the suffix keeps this repo's setup from
+# colliding with anyone else's. Leave `name_suffix` empty and the first run
+# generates one and records it in config.local.toml; every later run reuses it.
+# Setting `name` explicitly bypasses both and uses that name verbatim.
+name = ""
+base_name = "xdrip2gcp-test"
+name_suffix = ""
+
+location = "us-central1"
+storage_class = "STANDARD"
+
+# Both of these are safety rails: uniform access drops the legacy per-object
+# ACL system, and public access prevention stops the bucket from ever being
+# exposed to the internet, even by accident.
+uniform_bucket_level_access = true
+public_access_prevention = true
+
+# Auto-delete objects this many days after creation so repeated test runs can
+# never accumulate storage cost. Set to 0 to manage no lifecycle rule at all.
+lifecycle_age_days = 3
+
+[objects]
+# Every object this project writes lives under one of these prefixes, so test
+# data can never be confused with real CGM data later on.
+test_prefix = "test-data"
+data_prefix = "cgm-data"
+
+[test_data]
+# Generic payloads used to prove writes and reads work. Generation is seeded,
+# so the bytes are identical on every run and re-uploading is a no-op.
+record_count = 5
+random_seed = 20260904
+text_object = "hello.txt"
+json_object = "sample.json"
+
+# Nightscout-shaped CGM readings for exercising the function. The timestamps
+# are anchored to a fixed base so the serialized batch is byte-identical every
+# run, which is what makes the content-addressed object name predictable.
+entry_count = 3
+entry_base_ms = 1757000000000
+entry_interval_ms = 300000
+
+[gcloud]
+# The gcloud CLI needs Python 3.10+. Leave this empty to auto-detect (the
+# interpreter running the script if it qualifies, otherwise the active conda
+# env), or set an absolute path to pin it.
+cloudsdk_python = ""
+# Seconds before a gcloud invocation is considered hung.
+timeout_seconds = 120
+
+[gcp]
+# APIs the Cloud Function needs. `compute` is here because second-generation
+# functions build through Cloud Build, whose default identity is the Compute
+# Engine default service account; enabling it heads off a class of confusing
+# "service account does not exist" deployment failures.
+services = [
+    "cloudfunctions.googleapis.com",
+    "run.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "secretmanager.googleapis.com",
+    "compute.googleapis.com",
+]
+
+[service_accounts]
+# Dedicated identities rather than GCP's broad default accounts. The runtime
+# account can create objects in one bucket and read one secret, nothing else.
+runtime_id = "xdrip2gcp-fn-runtime"
+build_id = "xdrip2gcp-fn-build"
+runtime_role_bucket = "roles/storage.objectCreator"
+build_role_project = "roles/cloudbuild.builds.builder"
+
+[function]
+name = "xdrip2gcp-nightscout-test"
+# Leave region empty to follow [bucket].location and avoid cross-region egress.
+region = ""
+# Matches the conda environment's Python, so the offline tests exercise the
+# same language version the deployed function runs.
+runtime = "python314"
+entry_point = "nightscout"
+source_dir = "src/functions/nightscout"
+memory = "256Mi"
+timeout_seconds = 60
+# A public endpoint needs a ceiling: this caps what a flood of requests can
+# cost, at far above any real CGM upload rate (one request every 5 minutes).
+max_instances = 3
+# Required so a phone can reach the endpoint; the api-secret is what actually
+# guards it.
+allow_unauthenticated = true
+
+[auth]
+# Nightscout clients send sha1_hex(password) in this header. The function
+# hashes that again with scrypt and compares against the Secret Manager
+# payload, so GCP never holds anything replayable.
+header_name = "api-secret"
+secret_id = "xdrip2gcp-nightscout-api-secret"
+# Generated on first deploy and recorded in config.local.toml. This is the
+# value you type into xDrip; it is never sent to GCP in plaintext.
+password = ""
+password_bytes = 24
+
+# scrypt work factors. n must be a power of two; memory used is roughly
+# 128 * n * r bytes, so 16384 * 8 is about 16 MB per verification.
+scrypt_n = 16384
+scrypt_r = 8
+scrypt_p = 1
+scrypt_dklen = 32
+salt_bytes = 16
+
+# Reject anything larger before parsing it. Real xDrip batches are a few KB.
+max_request_bytes = 1048576

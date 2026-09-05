@@ -1,0 +1,4 @@
+# Dependencies of the deployed function only. Nothing here is needed locally:
+# the offline tests exercise nightscout_core, which is stdlib-only.
+functions-framework>=3.8,<4
+google-cloud-storage>=2.18,<4
