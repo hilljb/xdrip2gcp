@@ -195,8 +195,10 @@ src/xdrip2gcp/actions.py                      shared changed/no-op result type
 src/setup_gcp.py                              entry point: prepare the project
 src/deploy_function.py                        entry point: secret + deploy; --show-url, --force
 src/show_requests.py                          entry point: recent HTTP requests to the function
+src/show_latest.py                            entry point: the newest reading in the bucket
 src/config_env.py                             entry point: shell exports for the gcloud commands
 test/test_nightscout_core.py                  offline: the whole request path
+test/test_show_latest.py                      offline: newest-reading selection and formatting
 test/test_function_live.py                    live: deployment, HTTPS behaviour, bucket contents
 ```
 
@@ -374,7 +376,7 @@ python -m unittest discover -s test -t . -v
 * Nightscout-shaped entries POST successfully, land as NDJSON under
   `cgm-data/collection=entries/dt=.../<epoch-ms>-<hash>.ndjson`, and a repeat POST is reported
   as a duplicate with no second object.
-* 128 tests pass: 89 offline (well under a second), 39 live.
+* 144 tests pass: 105 offline (well under a second), 39 live.
 
 ## Stage 4: Send data to the test bucket from xDrip on a phone (Developer) ✓ Done
 
@@ -457,6 +459,27 @@ JSON, one reading per line. From the command line:
 ```bash
 gcloud storage ls --recursive "$XDRIP2GCP_BUCKET_URI/cgm-data/**"
 ```
+
+To read the data back rather than just list it, `show_latest.py` prints the newest reading and
+how old it is, which is the quickest way to confirm the phone is still uploading:
+
+```bash
+python src/show_latest.py                            # the newest reading
+python src/show_latest.py --count 10                 # the last ten
+python src/show_latest.py --collection devicestatus  # raw JSON
+python src/show_latest.py --collection entries       # raw JSON of bg values
+```
+
+```
+TIME (LOCAL)         MG/DL  DELTA   DIRECTION   DEVICE
+2026-09-04 17:58:34  89     +2.0    Flat        xDrip-DexcomG5
+
+newest reading is 2 minutes old (cgm-data/collection=entries/dt=2026-09-04/1788566314865-<hash>.ndjson)
+```
+
+It exits 4 when the collection is empty, so it also works as a check in a script. Because
+object names carry the reading's timestamp, it downloads only the last few objects of the
+newest day rather than scanning the bucket.
 
 Faster than waiting for an object to appear, and the best way to see what the phone is actually
 doing:
@@ -548,7 +571,7 @@ time order.
 Batch sizes vary: one upload carried two readings, the next carried one, which is why object
 names are per batch rather than per reading.
 
-128 tests pass after the naming change: 89 offline, 39 live.
+144 tests pass after the naming change: 105 offline, 39 live.
 
 One thing to know for the BigQuery stage: xDrip's `devicestatus` documents look like
 `{"device":"Google Pixel 9 Pro","uploader":{"battery":100,"type":"PHONE"}}` and carry **no
