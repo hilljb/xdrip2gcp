@@ -8,6 +8,7 @@ This plan will be broken into stages, some performed by the developer and some p
 2. Write to a GCP storage bucket using the `gcloud` cli.
 3. Make a GCP function that can write to the bucket and use the `gcloud` cli to access it.
 4. Send data from xDrip through that GCP function and into the bucket from a phone.
+5. After the test pipeline works, form a production pipeline for BigQuery data.
 
 ## Stage 1: GCP Project Setup and Local Dependencies (Developer) ✓ Done
 
@@ -195,7 +196,7 @@ src/xdrip2gcp/actions.py                      shared changed/no-op result type
 src/setup_gcp.py                              entry point: prepare the project
 src/deploy_function.py                        entry point: secret + deploy; --show-url, --force
 src/show_requests.py                          entry point: recent HTTP requests to the function
-src/show_latest.py                            entry point: the newest reading in the bucket
+src/show_latest.py                            entry point: the newest reading stored (bucket or BigQuery)
 src/config_env.py                             entry point: shell exports for the gcloud commands
 test/test_nightscout_core.py                  offline: the whole request path
 test/test_show_latest.py                      offline: newest-reading selection and formatting
@@ -582,3 +583,316 @@ object, so `devicestatus` records when a value *changed* rather than when it was
 is harmless for CGM readings, which each carry their own `date`, but it means device status
 cannot be used as a heartbeat. If reporting times matter later, that collection needs the
 server's receive time added before it is stored.
+
+## Stage 5: Create a BigQuery datastore using a GCP function (Agent) ✓ Done
+
+What this stage built:
+
+* A second Python HTTP Cloud Function (2nd gen), `xdrip2gcp-nightscout-bq`, deployed from this
+  repo with the `gcloud` cli and speaking the same Nightscout REST API as the Stage 3 one. xDrip
+  interacts with it identically: same endpoints, same `api-secret` scheme, same password. Only
+  the URL differs.
+* Readings are appended through the **BigQuery Storage Write API**, on its default stream.
+* One table, `entries`, rather than one per collection. `devicestatus` was dropped during design:
+  it carries a phone battery level and no timestamp of its own, so it could record when a value
+  *changed* but never when it was reported. `entries` each carry their own `date` and need
+  nothing assigned by the server.
+    * **Partitioned by day** on `reading_date_utc`, and clustered on `reading_date_local`, so a
+      query in either frame loads only the days it asks for.
+    * **Both clocks are stored, never computed**: `reading_time_utc` alongside
+      `reading_time_local` (Mountain wall clock), each with its date, plus `local_offset` and
+      `local_zone` so the `MDT`/`MST` in effect is a column rather than an inference.
+* A small `entries_latest` table holding **only the two most recent readings**, maintained by one
+  `MERGE` per upload that reads nothing but itself. Measured at exactly 10 MiB billed per upload,
+  flat forever, for the reasons in 5.4.
+* **Nothing expires.** No dataset default expiration, no partition expiration, and the function's
+  identity holds a custom role that cannot delete a table — so the endpoint has no authority to
+  rotate its own history out of existence.
+* Idempotent and tested. Re-running the setup and deploy scripts reports no-ops, and re-posting a
+  reading neither duplicates it in the view nor changes `entries_latest`. Verification readings
+  are marked `device = 'xdrip2gcp-test'` so they can be told apart from real data. By choice this
+  stage has offline tests only, covering reading identity, the row mapping, the daylight-saving
+  edge cases and the generated SQL; there is no test dataset, and correctness on GCP was
+  confirmed with the earlier stages and `show_latest.py`.
+* Naming and configuration follow the existing conventions: a `[bigquery]` and a `[function_bq]`
+  section in `resources/config.toml`, with anything instance-specific staying in the git-ignored
+  `resources/config.local.toml`.
+
+Three new dependencies, all of them only inside the deployed function's own `requirements.txt`
+(`google-cloud-bigquery-storage` for the appends, `google-cloud-bigquery` for the `MERGE`, and
+`tzdata` because a slim runtime image cannot be assumed to ship a zone database); nothing was
+added to the conda environment, and the offline tests still drive stdlib-only code.
+
+### 5.0 Decisions taken before building
+
+Seven questions were settled first, because each would have been expensive to reverse:
+
+* **A second function, not an extension of the Stage 3 one.** The bucket endpoint stays exactly
+  as it was, available whenever the phone should be pointed back at it for testing. The two
+  endpoints are not meant to run in parallel: as noted in Stage 4, xDrip clears its upload queue
+  as soon as *any* configured site accepts a reading, so two sites means gaps in whichever one
+  was down. One at a time.
+* **`devicestatus` was dropped.** It carries only a phone battery level and no timestamp, which
+  was the awkward part of the original schema. `entries` each carry their own `date`, so nothing
+  needs a server-assigned time.
+* **Duplicates are collapsed at read time, not prevented at write time.** See 5.2.
+* **Partitioned by UTC date, clustered by local date.** Both are stored, so a query in either
+  frame prunes.
+* **The two-row table is maintained by a MERGE against itself.** See 5.4, which is mostly about
+  what this costs.
+* **`treatments` and anything else is accepted and dropped**, rather than 404'd, so the phone
+  neither retries nor fills its log with errors.
+* **No live tests and no test dataset for this stage.** Offline tests cover the two things that
+  are impossible to eyeball later, and the earlier stages plus `show_latest.py` cover the rest.
+
+### 5.1 Layout
+
+```
+src/functions/nightscout_bq/main.py           Flask-to-core adapter, Storage Write API, MERGE (deployed)
+src/functions/nightscout_bq/bq_core.py        stdlib-only rows, schema and SQL (deployed + tested locally)
+src/functions/nightscout_bq/requirements.txt  the function's own dependencies
+src/xdrip2gcp/bigquery.py                     dataset, tables, view, custom role
+src/setup_bigquery.py                         entry point: prepare BigQuery; --dry-run, --reconcile-latest
+src/deploy_bq_function.py                     entry point: secret + deploy; --show-url, --force
+src/show_latest.py                            entry point: newest reading, --source bigquery|bucket
+src/config_env.py                             entry point: shell exports, now including the BigQuery names
+test/test_bq_core.py                          offline: reading identity, local time, generated SQL
+```
+
+The BigQuery function does **not** carry its own copy of `nightscout_core.py`. It imports it, and
+`function_source.staged` copies the file in beside it at deploy time, so there is one definition
+of the credential scheme no matter which endpoint the phone is pointed at, and no second copy in
+the repo to drift. That file's contents are folded into the deploy hash, so editing the shared
+module redeploys both functions rather than leaving this one on a stale copy.
+
+### 5.2 Idempotency, when the destination has no way to reject a duplicate
+
+Stages 2 through 4 got idempotency for free: object names were a hash of their own contents, and
+`if_generation_match=0` meant Cloud Storage itself refused a second identical write. BigQuery has
+no equivalent. Its `PRIMARY KEY` is metadata for the optimizer and is not enforced, and the
+Storage Write API's default stream is explicitly at-least-once, so a retry can duplicate a row.
+
+This matters more than it sounds, because duplicates arrive even with no retry at all. Stage 4
+recorded xDrip sending overlapping batches: one upload carried two readings, the next carried one
+of the same. So the pipeline had to be built to expect them.
+
+The arrangement:
+
+* Every reading gets a **`reading_id`**, the SHA-256 of `"<epoch-ms>|<device>"` truncated to 32
+  hex characters. Identity is deliberately the reading's *time and device*, not a hash of the
+  whole document, so a value xDrip revises after a calibration resolves to the same row rather
+  than becoming a second reading for one instant.
+* The raw table is **append-only and never mutated**. Duplicates land in it.
+* The **`entries_current` view** returns one row per `reading_id`, keeping the newest `ingest_time`
+  of each. Duplicates collapse; a revised value supersedes the original.
+* A failed append returns **503**, so xDrip keeps the reading in its own queue and retries. That
+  retry is what replaces the bucket as a safety net on this path, and it is safe precisely
+  because the view collapses whatever the retry adds.
+
+A batch that contains the same reading twice is collapsed in Python before the SQL runs, because
+MERGE refuses a source that matches one target row more than once.
+
+### 5.3 Both clocks are stored, not computed
+
+Each row carries `reading_time_utc` (TIMESTAMP), `reading_time_local` (DATETIME, the Mountain wall
+clock), `reading_date_utc` and `reading_date_local` (the partition and cluster keys), plus
+`local_offset` and `local_zone`. Nothing has to convert at query time, which was the requirement.
+
+The offset and abbreviation are not decoration. On 1 November 2026 the clocks go back at 02:00
+MDT, so 01:30 local happens twice, an hour apart. The wall clock alone cannot tell those readings
+apart; `local_zone` says `MDT` for the first and `MST` for the second. Converting *from* UTC is
+what keeps this unambiguous, and `test/test_bq_core.py` pins both that hour and the hour in March
+that never happens at all.
+
+The zone is `[bigquery].timezone` in config rather than hardcoded, validated at load time against
+the IANA database, and `tzdata` is in the function's requirements rather than trusting the
+runtime image to ship a zone database.
+
+### 5.4 The two-row table, and what it costs
+
+`entries_latest` holds only the newest readings, and the interesting question was how much it
+costs to keep it that way on every upload. The obvious implementation — rebuild it from the
+history with `ORDER BY ... LIMIT 2` — is the wrong shape: `ORDER BY`/`LIMIT` prunes no
+partitions and the dedupe window function forces a pass over all of them, so every upload would
+scan the entire history. At 288 readings a day and roughly 440 bytes a row that is about 400 GB a
+month in year one, growing linearly and crossing the 1 TiB monthly free allowance in year three.
+
+So the function never reads the history at all. It already holds the reading it just wrote, and
+the only other thing "the two most recent" depends on is the two rows already there, so one
+`MERGE` against that table alone does the whole job: combine its current contents with the new
+rows, rank them, keep the top two, and `WHEN NOT MATCHED BY SOURCE THEN DELETE` the rest.
+
+Measured, not estimated. Each such statement bills **10,485,760 bytes — exactly the 10 MiB
+minimum BigQuery charges per table referenced — while processing 38 bytes.** That is about 86 GB
+a month, 8% of the free allowance, and it stays there however many years of readings accumulate.
+
+Two behaviours were verified directly before the code was written around them:
+
+* Replaying a reading leaves the table byte-identical.
+* A week-late reading does not displace newer rows; it loses the ranking, as it should.
+
+DML is also excluded from the 1,500-table-modifications-per-day limit that a `CREATE OR REPLACE`
+would count against, so a backlog flush after the phone has been offline for days cannot exhaust
+it. The rate limit that does apply is 25 statements per 10 seconds per table, against one upload
+every five minutes.
+
+Failure to update this table never fails the request. It is derived state: the reading is already
+safely in the raw table, and the next upload reconciles it. `setup_bigquery.py --reconcile-latest`
+rebuilds it from the full history if it ever needs repairing — that one *does* scan the raw table,
+which is the cost the MERGE exists to avoid paying routinely.
+
+### 5.5 Permanence, enforced rather than configured
+
+No dataset default expiration, no partition expiration, and nothing in this repo issues a drop.
+The part that needed real thought was IAM: `roles/bigquery.dataEditor`, the obvious grant, can
+delete tables, which is exactly the authority a public endpoint should not have. So the function
+runs as `xdrip2gcp-bq-runtime` holding a custom role, `xdrip2gcpBigQueryWriter`, with five
+permissions and no delete among them:
+
+```
+bigquery.datasets.get  bigquery.jobs.create  bigquery.tables.get
+bigquery.tables.getData  bigquery.tables.updateData
+```
+
+The binding is project-level because `bigquery.jobs.create` is a project permission — a job is
+not owned by the dataset it reads. The dataset's location is fixed at creation and cannot be
+changed later, so it follows `[bucket].location` and the setup script prints it.
+
+### 5.6 Schema
+
+One table, `entries`, with typed columns for the fields xDrip sends and a native `JSON` column
+holding the document as received:
+
+```
+reading_id STRING NOT NULL        reading_time_utc TIMESTAMP NOT NULL
+reading_date_utc DATE NOT NULL    reading_time_local DATETIME NOT NULL
+reading_date_local DATE NOT NULL  local_offset STRING    local_zone STRING
+sgv INT64    delta FLOAT64    direction STRING    device STRING
+entry_type STRING    noise INT64    rssi INT64
+filtered FLOAT64    unfiltered FLOAT64
+date_string STRING    sys_time STRING
+ingest_time TIMESTAMP NOT NULL    raw JSON
+```
+
+`raw` is the hedge: a field xDrip starts sending tomorrow is captured today, even though it has no
+column of its own yet. Absent fields are stored as NULL rather than zero, which is why the
+protobuf descriptor the Storage Write API needs is generated as **proto2** — proto3's implicit
+presence would turn a missing `sgv` into a reading of 0.
+
+`bq_core.SCHEMA` is the single definition. The table DDL, the protobuf descriptor and the MERGE
+are all generated from it, so they cannot drift, and `setup_bigquery.py` applies a column added
+there to the existing tables with `ALTER TABLE ADD COLUMN IF NOT EXISTS` rather than needing a
+migration.
+
+Values from the phone are bound as query parameters, never formatted into SQL. The `JSON` column
+is the one exception to the mechanism: a JSON column cannot take a bound parameter, so the
+document is bound as text and wrapped in `PARSE_JSON(...)` in the statement.
+
+### 5.7 Point xDrip at it
+
+The same arrangement as 4.1 and 4.2, for the other endpoint. First a shell that knows the
+instance-specific names:
+
+```bash
+conda activate xdrip2gcp
+eval "$(python src/config_env.py)"
+```
+
+Alongside the Stage 3 variables that adds `XDRIP2GCP_BQ_URL`, `XDRIP2GCP_BQ_FUNCTION`,
+`XDRIP2GCP_DATASET`, `XDRIP2GCP_ENTRIES`, `XDRIP2GCP_CURRENT` and `XDRIP2GCP_LATEST`, so nothing
+below has to name a generated hostname.
+
+Then the connection string:
+
+```bash
+python src/deploy_bq_function.py --show-url
+```
+
+The first line is the endpoint; the second is what goes into xDrip, already in the format the app
+expects:
+
+```
+https://<password>@<function-host>/api/v1/
+```
+
+Both halves are filled in for you. `<function-host>` is `XDRIP2GCP_BQ_URL` without its
+`https://`, and the password is the *same* one the Stage 3 endpoint uses — the two functions share
+one Secret Manager credential precisely so that moving the phone between them is only a URL
+change. It is still 32 URL-safe characters, so it needs no escaping.
+
+In xDrip, `Settings` → `Cloud Upload` → `Nightscout Sync (REST-API)`, and replace the whole
+`Base URL` with the new string, keeping the trailing `/api/v1/`. Everything from 4.4 still
+applies, with one difference worth repeating: **replace it rather than appending it.** xDrip
+accepts several sites separated by spaces, but it clears its upload queue as soon as *any* of
+them accepts a reading, so pointing it at both endpoints gives you gaps in each rather than a
+complete copy in both. Run one at a time; the bucket endpoint stays deployed and is there
+whenever you want to switch back for testing.
+
+Uploads of `treatments` and `devicestatus` can be left switched on. This endpoint accepts them
+with a 200 and stores nothing, which keeps the phone from retrying or logging errors.
+
+To verify, `show_latest.py` now reads either destination and defaults to BigQuery:
+
+```bash
+python src/show_latest.py                      # newest reading, from entries_latest
+python src/show_latest.py --count 10           # the last ten, from the entries_current view
+python src/show_latest.py --raw                # the document as xDrip sent it
+python src/show_latest.py --source bucket      # the Stage 3 path, unchanged
+```
+
+`show_requests.py` still answers the "is the phone reaching the endpoint at all" question, but
+against the Stage 3 function; for this one, read the logs directly:
+
+```bash
+gcloud logging read \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=$XDRIP2GCP_BQ_FUNCTION" \
+  --freshness=10m --limit=20 --format="value(textPayload)"
+```
+
+And in the console, `BigQuery` → the dataset named by `$XDRIP2GCP_DATASET`.
+
+### 5.8 Verified results
+
+Provisioning and deployment are both idempotent; a second run of each reports only no-ops.
+
+The endpoint, probed live: `/status` and `/experiments/test` answer, a wrong secret gets 401, an
+entry with no timestamp gets 400 naming the fields it looked for, an unknown path gets 404 listing
+what is supported, and `devicestatus` and `treatments` get 200 with
+`x-xdrip2gcp-stored: ignored`. A stored reading returns headers reporting the table, the row
+count, and whether the latest-readings table was updated.
+
+A test reading posted twice, then read back:
+
+```
+$ python src/show_latest.py --count 5
+TIME (LOCAL)         ZONE  MG/DL  DELTA   DIRECTION   DEVICE
+2026-09-04 23:11:31  MDT   123    +1.5    Flat        xdrip2gcp-test
+2026-09-04 23:08:39  MDT   123    +1.5    Flat        xdrip2gcp-test
+
+newest reading is 9 minutes old (from xdrip2gcp.cgm.entries_current)
+```
+
+Four raw rows, two distinct `reading_id`s, two rows from the view, two rows in `entries_latest`:
+the at-least-once append and the collapse both doing their jobs. The reading at 23:11 local on
+4 September is stored with `reading_date_utc = 2026-09-05` and `reading_date_local = 2026-09-04`,
+which is exactly why both dates are columns.
+
+171 tests pass: 132 offline, 39 live.
+
+Two things to know:
+
+* The `python314` runtime was the main risk here, since `google-cloud-bigquery-storage` pulls in
+  `protobuf` and `grpcio`. Cloud Build resolved them without trouble; no runtime downgrade was
+  needed.
+* The verification readings above are in the permanent table, marked `device = 'xdrip2gcp-test'`.
+  Rows can be excluded with `WHERE device != 'xdrip2gcp-test'`, or deleted outright — though not
+  for the first while after they are written, since rows recently added through the Storage Write
+  API resist DML until the streaming buffer flushes.
+
+### 5.9 Run a BigQuery query
+
+Use the BigQuery console in your GCP project, find your way to the `xdrip2gcp` resource, and under `cgm` you should see the created tables. You can now run a query such as
+
+```
+SELECT * FROM `xdrip2gcp.cgm.entries` order by reading_date_utc desc LIMIT 1000
+```

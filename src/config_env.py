@@ -57,20 +57,29 @@ def main(argv: list[str] | None = None) -> int:
         "XDRIP2GCP_BUCKET_URI": config.bucket_uri,
         "XDRIP2GCP_FUNCTION": config.function.name,
         "XDRIP2GCP_REGION": config.function_region,
+        # Stage 5. The dataset and table names are not instance-specific, but
+        # having them here means a query can be pasted without looking them up.
+        "XDRIP2GCP_BQ_FUNCTION": config.function_bq.name,
+        "XDRIP2GCP_DATASET": config.dataset_id,
+        "XDRIP2GCP_ENTRIES": config.entries_table_id,
+        "XDRIP2GCP_CURRENT": config.current_view_id,
+        "XDRIP2GCP_LATEST": config.latest_table_id,
     }
 
-    url = None
+    urls: dict[str, str | None] = {"XDRIP2GCP_URL": None, "XDRIP2GCP_BQ_URL": None}
     if not args.no_remote and gcloud.preflight(config) is None:
-        url = cloudfunction.function_url(config)
-    if url:
-        exports["XDRIP2GCP_URL"] = url
+        urls["XDRIP2GCP_URL"] = cloudfunction.function_url(config)
+        urls["XDRIP2GCP_BQ_URL"] = cloudfunction.function_url(config, function=config.function_bq)
+    exports.update({name: url for name, url in urls.items() if url})
 
     print("# eval \"$(python src/config_env.py)\"")
     for name, value in exports.items():
         print(f"export {name}={shlex.quote(value)}")
 
-    if url is None and not args.no_remote:
-        print("# XDRIP2GCP_URL omitted: the function is not deployed or gcloud is unavailable")
+    if not args.no_remote:
+        for name, url in urls.items():
+            if url is None:
+                print(f"# {name} omitted: that function is not deployed or gcloud is unavailable")
 
     return 0
 

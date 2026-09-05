@@ -130,9 +130,13 @@ def ensure_password_version(config: Config) -> ActionResult:
     return ActionResult(True, "stored the first secret version")
 
 
-def ensure_accessor(config: Config) -> ActionResult:
-    """Let the runtime identity read this one secret, and nothing else."""
-    member = f"serviceAccount:{config.runtime_service_account}"
+def ensure_accessor(config: Config, service_account: str | None = None) -> ActionResult:
+    """Let one runtime identity read this one secret, and nothing else.
+
+    Both functions share this credential, so each of their identities needs a
+    binding here; the secret is the only thing they have in common.
+    """
+    member = f"serviceAccount:{service_account or config.runtime_service_account}"
     role = "roles/secretmanager.secretAccessor"
 
     policy = json.loads(
@@ -160,10 +164,10 @@ def secret_version_reference(config: Config) -> str:
     return f"{config.secret_resource}/versions/latest"
 
 
-def ensure_credential(config: Config) -> list[ActionResult]:
+def ensure_credential(config: Config, service_account: str | None = None) -> list[ActionResult]:
     """Bring the secret, its version and its IAM binding to the desired state."""
     return [
         ensure_secret(config),
         ensure_password_version(config),
-        ensure_accessor(config),
+        ensure_accessor(config, service_account),
     ]

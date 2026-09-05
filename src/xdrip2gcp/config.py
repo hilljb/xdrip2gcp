@@ -24,6 +24,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHARED_CONFIG_PATH = REPO_ROOT / "resources" / "config.toml"
@@ -50,12 +51,14 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class ServiceAccountConfig:
-    """Dedicated identities for building and running the function."""
+    """Dedicated identities for building and running the functions."""
 
     runtime_id: str
     build_id: str
     runtime_role_bucket: str
     build_role_project: str
+    bq_runtime_id: str = "xdrip2gcp-bq-runtime"
+    bq_role_id: str = "xdrip2gcpBigQueryWriter"
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,19 @@ class FunctionConfig:
     @property
     def source_path(self) -> Path:
         return REPO_ROOT / self.source_dir
+
+
+@dataclass(frozen=True)
+class BigQueryConfig:
+    """Where readings land in BigQuery, and in which timezone they are stamped."""
+
+    location: str
+    dataset: str
+    entries_table: str
+    current_view: str
+    latest_table: str
+    latest_rows: int
+    timezone: str
 
 
 @dataclass(frozen=True)
@@ -112,7 +128,9 @@ class Config:
     services: tuple[str, ...] = ()
     service_accounts: ServiceAccountConfig | None = None
     function: FunctionConfig | None = None
+    function_bq: FunctionConfig | None = None
     auth: AuthConfig | None = None
+    bigquery: BigQueryConfig | None = None
 
     @property
     def bucket_uri(self) -> str:
@@ -121,12 +139,21 @@ class Config:
     def test_object_uri(self, name: str) -> str:
         return f"{self.bucket_uri}/{self.test_prefix}/{name}"
 
+    def region_of(self, function: FunctionConfig) -> str:
+        """Where a function is deployed, defaulting to the bucket's location."""
+        return function.region or self.location
+
     @property
     def function_region(self) -> str:
-        """Where the function is deployed, defaulting to the bucket's location."""
-        if self.function is not None and self.function.region:
-            return self.function.region
-        return self.location
+        if self.function is None:
+            raise ConfigError("[function] is missing from the configuration")
+        return self.region_of(self.function)
+
+    @property
+    def function_bq_region(self) -> str:
+        if self.function_bq is None:
+            raise ConfigError("[function_bq] is missing from the configuration")
+        return self.region_of(self.function_bq)
 
     def service_account_email(self, account_id: str) -> str:
         return f"{account_id}@{self.project_id}.iam.gserviceaccount.com"
@@ -144,10 +171,62 @@ class Config:
         return self.service_account_email(self.service_accounts.build_id)
 
     @property
+    def bq_runtime_service_account(self) -> str:
+        if self.service_accounts is None:
+            raise ConfigError("[service_accounts] is missing from the configuration")
+        return self.service_account_email(self.service_accounts.bq_runtime_id)
+
+    @property
+    def bq_role_name(self) -> str:
+        """Full resource name of the custom BigQuery role."""
+        if self.service_accounts is None:
+            raise ConfigError("[service_accounts] is missing from the configuration")
+        return f"projects/{self.project_id}/roles/{self.service_accounts.bq_role_id}"
+
+    @property
     def secret_resource(self) -> str:
         if self.auth is None:
             raise ConfigError("[auth] is missing from the configuration")
         return f"projects/{self.project_id}/secrets/{self.auth.secret_id}"
+
+    @property
+    def bigquery_location(self) -> str:
+        """The dataset's location, defaulting to the bucket's."""
+        if self.bigquery is None:
+            raise ConfigError("[bigquery] is missing from the configuration")
+        return self.bigquery.location or self.location
+
+    @property
+    def dataset_id(self) -> str:
+        if self.bigquery is None:
+            raise ConfigError("[bigquery] is missing from the configuration")
+        return f"{self.project_id}.{self.bigquery.dataset}"
+
+    def table_id(self, table: str) -> str:
+        """A fully qualified `project.dataset.table` reference."""
+        return f"{self.dataset_id}.{table}"
+
+    def quoted_table(self, table: str) -> str:
+        """A table reference ready to drop into SQL."""
+        return f"`{self.table_id(table)}`"
+
+    @property
+    def entries_table_id(self) -> str:
+        if self.bigquery is None:
+            raise ConfigError("[bigquery] is missing from the configuration")
+        return self.table_id(self.bigquery.entries_table)
+
+    @property
+    def latest_table_id(self) -> str:
+        if self.bigquery is None:
+            raise ConfigError("[bigquery] is missing from the configuration")
+        return self.table_id(self.bigquery.latest_table)
+
+    @property
+    def current_view_id(self) -> str:
+        if self.bigquery is None:
+            raise ConfigError("[bigquery] is missing from the configuration")
+        return self.table_id(self.bigquery.current_view)
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -292,7 +371,9 @@ def load_config(
     gcp = raw.get("gcp", {})
     accounts = raw.get("service_accounts", {})
     function = raw.get("function", {})
+    function_bq = raw.get("function_bq", {})
     auth = raw.get("auth", {})
+    bigquery = raw.get("bigquery", {})
 
     project_id = str(project.get("id", "")).strip()
     if not project_id:
@@ -323,6 +404,20 @@ def load_config(
     if lifecycle_age_days < 0:
         raise ConfigError("[bucket].lifecycle_age_days may not be negative")
 
+    latest_rows = int(bigquery.get("latest_rows", 2))
+    if latest_rows < 1:
+        raise ConfigError("[bigquery].latest_rows must be at least 1")
+
+    timezone_name = str(bigquery.get("timezone", "America/Denver")).strip()
+    if not timezone_name:
+        raise ConfigError("[bigquery].timezone is required")
+    try:
+        ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ConfigError(
+            f"[bigquery].timezone must be an IANA zone name like 'America/Denver', got {timezone_name!r}"
+        ) from error
+
     return Config(
         project_id=project_id,
         bucket_name=bucket_name,
@@ -342,6 +437,8 @@ def load_config(
             build_id=str(accounts.get("build_id", "xdrip2gcp-fn-build")),
             runtime_role_bucket=str(accounts.get("runtime_role_bucket", "roles/storage.objectCreator")),
             build_role_project=str(accounts.get("build_role_project", "roles/cloudbuild.builds.builder")),
+            bq_runtime_id=str(accounts.get("bq_runtime_id", "xdrip2gcp-bq-runtime")),
+            bq_role_id=str(accounts.get("bq_role_id", "xdrip2gcpBigQueryWriter")),
         ),
         function=FunctionConfig(
             name=str(function.get("name", "xdrip2gcp-nightscout-test")),
@@ -353,6 +450,26 @@ def load_config(
             timeout_seconds=int(function.get("timeout_seconds", 60)),
             max_instances=int(function.get("max_instances", 3)),
             allow_unauthenticated=bool(function.get("allow_unauthenticated", True)),
+        ),
+        function_bq=FunctionConfig(
+            name=str(function_bq.get("name", "xdrip2gcp-nightscout-bq")),
+            region=str(function_bq.get("region", "")).strip(),
+            runtime=str(function_bq.get("runtime", "python314")),
+            entry_point=str(function_bq.get("entry_point", "nightscout_bq")),
+            source_dir=str(function_bq.get("source_dir", "src/functions/nightscout_bq")),
+            memory=str(function_bq.get("memory", "256Mi")),
+            timeout_seconds=int(function_bq.get("timeout_seconds", 60)),
+            max_instances=int(function_bq.get("max_instances", 3)),
+            allow_unauthenticated=bool(function_bq.get("allow_unauthenticated", True)),
+        ),
+        bigquery=BigQueryConfig(
+            location=str(bigquery.get("location", "")).strip(),
+            dataset=str(bigquery.get("dataset", "cgm")).strip(),
+            entries_table=str(bigquery.get("entries_table", "entries")).strip(),
+            current_view=str(bigquery.get("current_view", "entries_current")).strip(),
+            latest_table=str(bigquery.get("latest_table", "entries_latest")).strip(),
+            latest_rows=latest_rows,
+            timezone=timezone_name,
         ),
         auth=AuthConfig(
             header_name=str(auth.get("header_name", "api-secret")),
