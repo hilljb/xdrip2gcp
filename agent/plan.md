@@ -477,6 +477,8 @@ TIME (LOCAL)         MG/DL  DELTA   DIRECTION   DEVICE
 newest reading is 2 minutes old (cgm-data/collection=entries/dt=2026-09-04/1788566314865-<hash>.ndjson)
 ```
 
+Note: Dexcom G7 readings are being sent by xDrip under the device name `xDrip-DexcomG5`.
+
 It exits 4 when the collection is empty, so it also works as a check in a script. Because
 object names carry the reading's timestamp, it downloads only the last few objects of the
 newest day rather than scanning the bucket.
