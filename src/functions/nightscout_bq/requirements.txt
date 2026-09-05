@@ -1,0 +1,9 @@
+# The function's own dependencies, installed by Cloud Build at deploy time.
+functions-framework>=3.8,<4
+# Appends go through the Storage Write API; the MERGE that maintains the
+# latest-readings table needs the ordinary query client.
+google-cloud-bigquery-storage>=2.27,<3
+google-cloud-bigquery>=3.25,<4
+# zoneinfo is stdlib, but the zone database it reads is not always present in
+# a slim runtime image, and every row depends on America/Denver resolving.
+tzdata>=2025.1

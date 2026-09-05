@@ -1,21 +1,30 @@
 #!/usr/bin/env python
-"""Show the most recent reading stored in the bucket.
+"""Show the most recent reading that was stored.
 
 `show_requests.py` answers "is the phone reaching the endpoint"; this answers
 "what actually landed". Handy after changing anything on the phone, and as a
 quick check that a reading is as fresh as it should be.
 
-Object names carry the reading's own epoch-millisecond timestamp, so the newest
-data is found by listing names rather than by reading every object: only the
-last few objects of the newest day are downloaded.
+Both destinations are readable, since the phone can be pointed at either
+endpoint:
+
+    --source bigquery  (default)  the Stage 5 dataset
+    --source bucket               the Stage 3 bucket
+
+Each is read the cheap way. In the bucket, object names carry the reading's own
+epoch-millisecond timestamp, so the newest data is found by listing names
+rather than by reading every object. In BigQuery, a request for no more
+readings than the latest-readings table holds is answered from that table,
+which is two rows, rather than from the history; the footer says which table
+answered.
 
 Run from the repo root:
 
     python src/show_latest.py
     python src/show_latest.py --count 10
-    python src/show_latest.py --collection devicestatus --raw
+    python src/show_latest.py --source bucket --collection devicestatus --raw
 
-Exit codes: 4 means the bucket holds no data for that collection yet.
+Exit codes: 4 means nothing is stored there yet.
 """
 
 from __future__ import annotations
@@ -30,7 +39,7 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from xdrip2gcp import bucket, gcloud  # noqa: E402
+from xdrip2gcp import bigquery, bucket, gcloud  # noqa: E402
 from xdrip2gcp.config import Config, ConfigError, load_config  # noqa: E402
 from xdrip2gcp.function_source import core_module  # noqa: E402
 
@@ -178,14 +187,103 @@ def report(
     return 0
 
 
+# How far back the first BigQuery query looks, then how far it widens to. The
+# point of the first window is to touch one or two partitions in the ordinary
+# case; the wider ones are for coming back to a project that has been idle.
+WINDOWS_DAYS = (2, 30, None)
+
+
+def bigquery_rows(config: Config, count: int) -> tuple[list[dict[str, Any]], str]:
+    """The newest readings from BigQuery, and the name of the table read.
+
+    Both timestamps are already stored, so this converts nothing: the local
+    wall clock and the zone it was in are columns, which is the whole point of
+    storing them.
+    """
+    columns = (
+        "FORMAT_DATETIME('%Y-%m-%d %H:%M:%S', reading_time_local) AS local_text, "
+        "local_zone, sgv, delta, direction, device, "
+        "UNIX_MILLIS(reading_time_utc) AS utc_ms, "
+        "TO_JSON_STRING(raw) AS raw_text"
+    )
+
+    # The latest-readings table exists precisely to answer this question
+    # without touching the history, so use it when it can.
+    if count <= config.bigquery.latest_rows:
+        table = config.bigquery.latest_table
+        rows = bigquery.query_rows(
+            config,
+            f"SELECT {columns} FROM {config.quoted_table(table)} "
+            f"ORDER BY reading_time_utc DESC LIMIT {count}",
+        )
+        if rows:
+            return rows, config.table_id(table)
+
+    view = config.quoted_table(config.bigquery.current_view)
+    for days in WINDOWS_DAYS:
+        window = (
+            f"WHERE reading_date_utc >= DATE_SUB(CURRENT_DATE('UTC'), INTERVAL {days} DAY) "
+            if days is not None
+            else ""
+        )
+        rows = bigquery.query_rows(
+            config,
+            f"SELECT {columns} FROM {view} {window}ORDER BY reading_time_utc DESC LIMIT {count}",
+        )
+        if rows:
+            return rows, config.current_view_id
+    return [], config.current_view_id
+
+
+def print_bigquery_rows(rows: list[dict[str, Any]]) -> None:
+    print(f"{'TIME (LOCAL)':19}  {'ZONE':4}  {'MG/DL':5}  {'DELTA':6}  {'DIRECTION':10}  DEVICE")
+    for row in rows:
+        print(
+            f"{row.get('local_text') or 'unknown':19}  "
+            f"{row.get('local_zone') or '-':4}  "
+            f"{str(row.get('sgv') or '-'):5}  "
+            f"{format_delta(row.get('delta')):6}  "
+            f"{str(row.get('direction') or '-'):10}  "
+            f"{row.get('device') or '-'}"
+        )
+
+
+def report_bigquery(config: Config, count: int, raw: bool) -> int:
+    rows, source = bigquery_rows(config, count)
+    if not rows:
+        print(f"no readings stored in {config.entries_table_id} yet", file=sys.stderr)
+        return 4
+
+    if raw:
+        for row in rows:
+            print(row.get("raw_text") or "{}")
+    else:
+        print_bigquery_rows(rows)
+
+    newest = rows[0].get("utc_ms")
+    print()
+    if newest is None:
+        print(f"newest reading has no timestamp (from {source})")
+    else:
+        age = (datetime.now(timezone.utc).timestamp() * 1000 - int(newest)) / 1000
+        print(f"newest reading is {human_age(age)} (from {source})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     core = core_module()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
+        "--source",
+        default="bigquery",
+        choices=("bigquery", "bucket"),
+        help="where to read from (default: bigquery)",
+    )
+    parser.add_argument(
         "--collection",
         default="entries",
         choices=core.WRITABLE_COLLECTIONS,
-        help="which collection to read (default: entries)",
+        help="which collection to read; bucket only, BigQuery stores entries alone",
     )
     parser.add_argument("--count", type=int, default=1, help="how many documents to show")
     parser.add_argument("--raw", action="store_true", help="print stored JSON instead of a table")
@@ -204,6 +302,18 @@ def main(argv: list[str] | None = None) -> int:
     if reason is not None:
         print(f"cannot reach GCP: {reason}", file=sys.stderr)
         return 3
+
+    if args.source == "bigquery":
+        if args.collection != "entries":
+            parser.error("BigQuery stores only entries; use --source bucket for other collections")
+        if not gcloud.bq_available():
+            print("the bq CLI is not on PATH; it ships with the Cloud SDK", file=sys.stderr)
+            return 3
+        try:
+            return report_bigquery(config, args.count, args.raw)
+        except gcloud.GcloudError as error:
+            print(f"bq failed: {error}", file=sys.stderr)
+            return 5
 
     prefix = f"{config.data_prefix}/collection={args.collection}/"
     try:

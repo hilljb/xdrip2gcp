@@ -21,13 +21,21 @@ from .config import Config
 class GcloudError(Exception):
     """Raised when a gcloud invocation fails."""
 
-    def __init__(self, args: Sequence[str], returncode: int, stdout: str, stderr: str):
+    def __init__(
+        self,
+        args: Sequence[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        program: str = "gcloud",
+    ):
         self.args_run = list(args)
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+        rendered = " ".join(part for part in (program, *args) if part)
         super().__init__(
-            f"`gcloud {' '.join(args)}` exited {returncode}\n"
+            f"`{rendered}` exited {returncode}\n"
             f"stdout: {stdout.strip()}\nstderr: {stderr.strip()}"
         )
 
@@ -94,6 +102,58 @@ def run(
 
 def run_json(config: Config, args: Sequence[str]) -> Any:
     return run(config, [*args, "--format=json"]).json()
+
+
+def bq_available() -> bool:
+    return shutil.which("bq") is not None
+
+
+def run_bq(
+    config: Config,
+    args: Sequence[str],
+    *,
+    check: bool = True,
+    location: str | None = None,
+    timeout: int | None = None,
+) -> GcloudResult:
+    """Run `bq <args>`, the SDK's BigQuery CLI.
+
+    BigQuery is the one thing `gcloud` cannot manage: datasets and tables are
+    `bq`'s territory, and it ships with the same Cloud SDK, so this needs no
+    new dependency and reuses the same login and interpreter.
+    """
+    command = ["bq", f"--project_id={config.project_id}"]
+    if location:
+        command.append(f"--location={location}")
+    command.extend(args)
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        env=build_env(config),
+        timeout=timeout or config.gcloud_timeout_seconds,
+        check=False,
+    )
+    result = GcloudResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout.decode("utf-8", errors="replace"),
+        stderr=completed.stderr.decode("utf-8", errors="replace"),
+    )
+    if check and not result.ok:
+        raise GcloudError(command[1:], result.returncode, result.stdout, result.stderr, program="bq")
+    return result
+
+
+def bq_query(
+    config: Config, sql: str, *, location: str | None = None, check: bool = True
+) -> GcloudResult:
+    """Run one standard-SQL statement, returning rows as JSON when there are any."""
+    return run_bq(
+        config,
+        ["query", "--use_legacy_sql=false", "--format=json", "--quiet", sql],
+        location=location,
+        check=check,
+    )
 
 
 def active_account(config: Config) -> str | None:

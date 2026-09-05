@@ -73,6 +73,11 @@ services = [
     "artifactregistry.googleapis.com",
     "secretmanager.googleapis.com",
     "compute.googleapis.com",
+    # Stage 5. The Storage API is the one the Storage Write API lives behind;
+    # both are on by default in new projects but are listed so a fresh setup
+    # does not depend on that.
+    "bigquery.googleapis.com",
+    "bigquerystorage.googleapis.com",
 ]
 
 [service_accounts]
@@ -82,6 +87,12 @@ runtime_id = "xdrip2gcp-fn-runtime"
 build_id = "xdrip2gcp-fn-build"
 runtime_role_bucket = "roles/storage.objectCreator"
 build_role_project = "roles/cloudbuild.builds.builder"
+
+# The BigQuery function gets its own identity: it needs no bucket access at
+# all, and a custom role rather than roles/bigquery.dataEditor because that
+# role can delete tables and Stage 5 data is meant to be permanent.
+bq_runtime_id = "xdrip2gcp-bq-runtime"
+bq_role_id = "xdrip2gcpBigQueryWriter"
 
 [function]
 name = "xdrip2gcp-nightscout-test"
@@ -99,6 +110,43 @@ timeout_seconds = 60
 max_instances = 3
 # Required so a phone can reach the endpoint; the api-secret is what actually
 # guards it.
+allow_unauthenticated = true
+
+[bigquery]
+# Stage 5. A second function, identical to the phone, that lands readings in
+# BigQuery instead of the bucket.
+#
+# A dataset's location is fixed when it is created and cannot be changed
+# afterwards; leave this empty to follow [bucket].location.
+location = ""
+# Named for what it holds rather than the project, so queries read as
+# `xdrip2gcp.cgm.entries` instead of repeating the project name.
+dataset = "cgm"
+# Raw, append-only readings. Partitioned by UTC date, clustered by local date.
+entries_table = "entries"
+# One row per reading: the view that collapses duplicates and superseded values.
+current_view = "entries_current"
+# The small lookup table holding only the most recent readings.
+latest_table = "entries_latest"
+latest_rows = 2
+# Readings are stored with both a UTC timestamp and a local wall-clock time so
+# no query has to convert. Change this if you are not on Mountain time; it is
+# an IANA zone name, and the MDT/MST abbreviation is derived from it per
+# reading.
+timezone = "America/Denver"
+
+[function_bq]
+# Deployed alongside the Stage 3 function, sharing its Nightscout password, so
+# moving the phone between them is only a URL change.
+name = "xdrip2gcp-nightscout-bq"
+# Leave region empty to follow [bucket].location.
+region = ""
+runtime = "python314"
+entry_point = "nightscout_bq"
+source_dir = "src/functions/nightscout_bq"
+memory = "256Mi"
+timeout_seconds = 60
+max_instances = 3
 allow_unauthenticated = true
 
 [auth]
