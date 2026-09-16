@@ -78,6 +78,9 @@ services = [
     # does not depend on that.
     "bigquery.googleapis.com",
     "bigquerystorage.googleapis.com",
+    # The current reading's home. Firestore's IAM permissions are named
+    # datastore.* for historical reasons, but only this API needs enabling.
+    "firestore.googleapis.com",
 ]
 
 [service_accounts]
@@ -93,6 +96,10 @@ build_role_project = "roles/cloudbuild.builds.builder"
 # role can delete tables and Stage 5 data is meant to be permanent.
 bq_runtime_id = "xdrip2gcp-bq-runtime"
 bq_role_id = "xdrip2gcpBigQueryWriter"
+# The same identity also publishes the current reading, under a second custom
+# role: it can create and overwrite that one document but not delete it, and
+# cannot delete or export a database.
+firestore_role_id = "xdrip2gcpCurrentWriter"
 
 [function]
 name = "xdrip2gcp-nightscout-test"
@@ -126,14 +133,29 @@ dataset = "cgm"
 entries_table = "entries"
 # One row per reading: the view that collapses duplicates and superseded values.
 current_view = "entries_current"
-# The small lookup table holding only the most recent readings.
-latest_table = "entries_latest"
-latest_rows = 2
 # Readings are stored with both a UTC timestamp and a local wall-clock time so
 # no query has to convert. Change this if you are not on Mountain time; it is
 # an IANA zone name, and the MDT/MST abbreviation is derived from it per
 # reading.
 timezone = "America/Denver"
+
+[firestore]
+# The current reading lives here rather than in BigQuery. BigQuery is a
+# warehouse: it answers questions about history cheaply and answers "what is the
+# value right now" expensively, because every query bills a 10 MiB minimum. One
+# Firestore document is the right shape for a single value that is read often
+# and overwritten every five minutes.
+#
+# Like a BigQuery dataset, a Firestore database's location and mode are fixed
+# when it is created. Native mode is required for the realtime listeners that
+# let a reader be pushed updates instead of polling. Leave location empty to
+# follow [bucket].location.
+database = "(default)"
+location = ""
+collection = "current"
+# One document, overwritten in place. `entries` matches the collection name the
+# readings arrive under.
+document = "entries"
 
 [function_bq]
 # Deployed alongside the Stage 3 function, sharing its Nightscout password, so

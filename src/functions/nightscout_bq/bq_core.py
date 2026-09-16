@@ -9,9 +9,9 @@ destination, and that is all this module adds.
 Everything here is stdlib-only and side-effect free. Rows are built as plain
 Python values and handed to injected callables, so the whole request path can
 be exercised offline; the deployed adapter is what turns those values into
-protobuf for the Storage Write API and into query parameters for the MERGE.
+protobuf for the Storage Write API and into a Firestore document.
 
-Three ideas carry most of the design:
+Four ideas carry most of the design:
 
 * **Identity is (reading time, device), not the whole document.** Hashing
   those two into a `reading_id` means a reading resent by xDrip's retry, or
@@ -27,6 +27,11 @@ Three ideas carry most of the design:
   timestamp and the local wall clock, plus the offset and abbreviation that
   wall clock was in, so no query has to convert and the hour that repeats when
   the clocks go back stays interpretable.
+* **"Now" is a document, not a query.** BigQuery bills a 10 MiB minimum per
+  table referenced per query, so asking it for the current value costs the
+  same whether one row is wanted or a thousand. The current reading is
+  published to one Firestore document instead, and because the newest reading
+  received is not always the newest reading, that write is conditional.
 """
 
 from __future__ import annotations
@@ -52,9 +57,8 @@ SERVER_VERSION = f"{core.SERVER_NAME}-stage5"
 class Column:
     """One column, in the one place the schema is defined.
 
-    The table DDL, the protobuf descriptor the Storage Write API needs, and the
-    MERGE that maintains the latest-readings table are all generated from this,
-    so they cannot drift apart.
+    The table DDL and the protobuf descriptor the Storage Write API needs are
+    both generated from this, so the wire format cannot drift from the table.
     """
 
     name: str
@@ -251,9 +255,10 @@ def build_rows(
 ) -> list[dict[str, Any]]:
     """Build rows for a batch, keeping one row per reading identity.
 
-    A batch can legitimately contain the same reading twice; MERGE rejects a
-    source that matches a target row more than once, so the batch is collapsed
-    here rather than in SQL.
+    A batch can legitimately contain the same reading twice. Duplicate rows are
+    harmless in the append-only table, but collapsing them here keeps the row
+    count in the response honest and makes "which of these is newest" a
+    question with one answer.
     """
     rows: dict[str, dict[str, Any]] = {}
     for document in documents:
@@ -294,14 +299,6 @@ def create_entries_ddl(table: str, columns: Sequence[Column] = SCHEMA) -> str:
     )
 
 
-def create_latest_ddl(table: str, keep: int, columns: Sequence[Column] = SCHEMA) -> str:
-    """DDL for the small lookup table: same shape, no partitioning."""
-    return (
-        f"CREATE TABLE IF NOT EXISTS {table} (\n{schema_ddl(columns)}\n)\n"
-        f"OPTIONS (description = 'The {keep} most recent readings, maintained by the function')"
-    )
-
-
 def current_view_body(source: str) -> str:
     """The query behind the view, which is all BigQuery stores of it.
 
@@ -325,86 +322,63 @@ def create_current_view_sql(view: str, source: str) -> str:
     )
 
 
-def parameter_name(index: int, column: str) -> str:
-    return f"r{index}_{column}"
+# --------------------------------------------------------------------------
+# The current reading
+# --------------------------------------------------------------------------
+
+# The reading's own time, in epoch milliseconds, carried on the published
+# document. It is what makes a conditional write possible: the value is only
+# replaced when the incoming reading is newer than the one already there.
+CURRENT_EPOCH_FIELD = "reading_epoch_ms"
 
 
-# A JSON column cannot take a bound parameter directly, so the raw document is
-# bound as text and parsed in the statement. PARSE_JSON of a NULL is NULL, so
-# this needs no special case for a missing value.
-def parameter_type(column: Column) -> str:
-    return "STRING" if column.type == "JSON" else column.type
+def current_document(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The document published as "the reading right now".
 
-
-def parameter_expression(column: Column, name: str) -> str:
-    return f"PARSE_JSON(@{name})" if column.type == "JSON" else f"@{name}"
-
-
-def merge_latest_sql(
-    table: str, row_count: int, keep: int, columns: Sequence[Column] = SCHEMA
-) -> str:
-    """The one statement that maintains the latest-readings table.
-
-    It reads nothing but the table it maintains, which is what keeps its cost
-    flat: BigQuery bills a 10 MiB minimum per table referenced, and this
-    references one table holding `keep` rows, so the price of an upload never
-    grows with the history in the raw table.
-
-    Combining the new rows with the current contents before ranking is what
-    makes it safe in both awkward directions. Replaying a reading changes
-    nothing, and a batch that arrives days late loses the ranking to the rows
-    already there instead of displacing them.
+    A separate shape from the BigQuery row rather than the row itself, for two
+    reasons. Firestore has no equivalent of a DATETIME, so the local wall clock
+    is published as text alongside the zone it was in, rather than as a
+    timestamp that would silently be read back as UTC. And the columns that
+    only exist to serve the warehouse — the partition and cluster dates, the
+    raw document, the ingest time — are noise to a reader that wants one value.
     """
-    names = [column.name for column in columns]
-    columns_sql = ", ".join(names)
-
-    new_rows = "\n      UNION ALL ".join(
-        "SELECT "
-        + ", ".join(
-            f"{parameter_expression(column, parameter_name(index, column.name))} AS {column.name}"
-            for column in columns
-        )
-        for index in range(row_count)
-    )
-
-    updates = ", ".join(f"{name} = s.{name}" for name in names if name != IDENTITY_COLUMN)
-    inserts = ", ".join(f"s.{name}" for name in names)
-
-    return (
-        f"MERGE {table} AS t\n"
-        "USING (\n"
-        "  SELECT * FROM (\n"
-        f"      SELECT {columns_sql} FROM {table}\n"
-        f"      UNION ALL {new_rows}\n"
-        "  )\n"
-        f"  QUALIFY ROW_NUMBER() OVER (\n"
-        f"    PARTITION BY {IDENTITY_COLUMN} ORDER BY {INGEST_COLUMN} DESC, {ORDER_COLUMN} DESC\n"
-        "  ) = 1\n"
-        f"  ORDER BY {ORDER_COLUMN} DESC\n"
-        f"  LIMIT {keep}\n"
-        ") AS s\n"
-        f"ON t.{IDENTITY_COLUMN} = s.{IDENTITY_COLUMN}\n"
-        f"WHEN MATCHED THEN UPDATE SET {updates}\n"
-        f"WHEN NOT MATCHED BY TARGET THEN INSERT ({columns_sql}) VALUES ({inserts})\n"
-        "WHEN NOT MATCHED BY SOURCE THEN DELETE"
-    )
+    return {
+        "reading_id": row[IDENTITY_COLUMN],
+        CURRENT_EPOCH_FIELD: int(row[ORDER_COLUMN].timestamp() * 1000),
+        "reading_time_utc": row[ORDER_COLUMN],
+        # Seconds, because this is the value a reader displays; the exact
+        # instant is in reading_time_utc and reading_epoch_ms beside it.
+        "reading_time_local": row["reading_time_local"].isoformat(sep=" ", timespec="seconds"),
+        "local_zone": row["local_zone"],
+        "local_offset": row["local_offset"],
+        "sgv": row["sgv"],
+        "delta": row["delta"],
+        "direction": row["direction"],
+        "device": row["device"],
+        "published_at": row[INGEST_COLUMN],
+    }
 
 
-def merge_parameters(
-    rows: Sequence[Mapping[str, Any]], columns: Sequence[Column] = SCHEMA
-) -> list[tuple[str, str, Any]]:
-    """Name, BigQuery type and value for every parameter the MERGE binds.
+def supersedes(candidate: Mapping[str, Any], stored: Mapping[str, Any] | None) -> bool:
+    """Whether a candidate document should replace what is already published.
 
-    Values from the phone are bound as parameters rather than formatted into
-    the statement, so a device name containing a quote is data and never SQL.
+    The current value must never go backwards. xDrip resends readings, and a
+    batch queued during an outage arrives carrying old timestamps, so "the
+    newest reading received" and "the newest reading" are not the same thing.
+    Equal timestamps count as superseding, so a replay refreshes the document
+    rather than being rejected: the write is the same either way, and treating
+    it as a no-op would need the comparison to be exact about values it does
+    not otherwise care about.
     """
-    parameters = []
-    for index, row in enumerate(rows):
-        for column in columns:
-            parameters.append(
-                (parameter_name(index, column.name), parameter_type(column), row.get(column.name))
-            )
-    return parameters
+    if not stored:
+        return True
+    previous = stored.get(CURRENT_EPOCH_FIELD)
+    if previous is None:
+        return True
+    try:
+        return int(candidate[CURRENT_EPOCH_FIELD]) >= int(previous)
+    except (TypeError, ValueError):
+        return True
 
 
 # --------------------------------------------------------------------------
@@ -415,10 +389,11 @@ def merge_parameters(
 # non-2xx response so the phone retries.
 RowAppender = Callable[[Sequence[Mapping[str, Any]]], None]
 
-# Maintains the latest-readings table. Returns False when it could not, which
-# is reported but never fails the request: the table is derived state and the
-# next upload rebuilds it.
-LatestUpdater = Callable[[Sequence[Mapping[str, Any]]], bool]
+# Publishes the current reading. Returns what happened, for the response
+# header: "updated", "stale" when the published value was already newer, or
+# "failed". Never raises past the handler, because the document is derived from
+# a reading already stored and the next upload republishes it.
+CurrentPublisher = Callable[[Mapping[str, Any]], str]
 
 
 def _utcnow() -> datetime:
@@ -432,8 +407,9 @@ class Handler:
     secret_payload: Mapping[str, Any]
     appender: RowAppender
     timezone_name: str = "America/Denver"
-    latest_updater: LatestUpdater | None = None
+    publisher: CurrentPublisher | None = None
     entries_table: str = ""
+    current_path: str = ""
     header_name: str = "api-secret"
     max_request_bytes: int = 1048576
     now: Callable[[], datetime] = _utcnow
@@ -545,11 +521,13 @@ class Handler:
         # duplicate rows are collapsed by the view.
         self.appender(rows)
 
-        latest = "skipped"
-        if self.latest_updater is not None:
-            latest = "updated" if self.latest_updater(rows) else "failed"
-
+        # Only the newest reading of the batch is worth publishing as "now",
+        # and only it can move the current value forward.
         newest = newest_row(rows)
+        current = "skipped"
+        if self.publisher is not None and newest is not None:
+            current = self.publisher(current_document(newest))
+
         return core.json_response(
             200,
             documents,
@@ -558,7 +536,8 @@ class Handler:
                 "x-xdrip2gcp-rows": str(len(rows)),
                 "x-xdrip2gcp-documents": str(len(documents)),
                 "x-xdrip2gcp-stored": "appended",
-                "x-xdrip2gcp-latest": latest,
+                "x-xdrip2gcp-current": current,
+                "x-xdrip2gcp-current-path": self.current_path,
                 "x-xdrip2gcp-reading-id": str(newest[IDENTITY_COLUMN]) if newest else "",
             },
         )

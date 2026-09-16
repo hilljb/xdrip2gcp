@@ -1,9 +1,9 @@
 """Cloud Function entry point for the BigQuery-backed Nightscout endpoint.
 
 An adapter, like the Stage 3 function's: it translates a Flask request into
-the framework-free `Request` of `nightscout_core`, supplies the two BigQuery
-writers `bq_core` needs, and translates the result back. Everything worth
-testing lives in `bq_core`, which has no cloud dependencies.
+the framework-free `Request` of `nightscout_core`, supplies the two writers
+`bq_core` needs, and translates the result back. Everything worth testing
+lives in `bq_core`, which has no cloud dependencies.
 
 The two writers are deliberately different in how they fail:
 
@@ -12,9 +12,9 @@ The two writers are deliberately different in how they fail:
   xDrip keeps the reading in its own queue and retries; the retry is harmless
   because duplicate rows are collapsed by the `entries_current` view. This is
   what replaces the bucket as a safety net on this path.
-* Maintaining the latest-readings table is one MERGE. It is derived state, so
-  a failure is reported in a response header and nothing more: the next
-  upload reconstructs it.
+* Publishing the current reading to Firestore is derived state: the reading is
+  already stored by the time it runs, so a failure is reported in a response
+  header and nothing more, and the next upload republishes it.
 
 The protobuf descriptor the Storage Write API needs is built at runtime from
 `bq_core.SCHEMA`, the same definition that generates the table DDL, so the
@@ -30,7 +30,7 @@ import traceback
 from datetime import date
 from typing import Any, Mapping, Sequence
 
-from google.cloud import bigquery, bigquery_storage_v1
+from google.cloud import bigquery_storage_v1, firestore
 from google.cloud.bigquery_storage_v1 import types, writer
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
@@ -40,10 +40,10 @@ import nightscout_core as core
 PROJECT_ENV = "XDRIP2GCP_BQ_PROJECT"
 DATASET_ENV = "XDRIP2GCP_BQ_DATASET"
 ENTRIES_ENV = "XDRIP2GCP_BQ_ENTRIES_TABLE"
-LATEST_ENV = "XDRIP2GCP_BQ_LATEST_TABLE"
-LATEST_ROWS_ENV = "XDRIP2GCP_BQ_LATEST_ROWS"
 TIMEZONE_ENV = "XDRIP2GCP_BQ_TIMEZONE"
-LOCATION_ENV = "XDRIP2GCP_BQ_LOCATION"
+DATABASE_ENV = "XDRIP2GCP_FS_DATABASE"
+COLLECTION_ENV = "XDRIP2GCP_FS_COLLECTION"
+DOCUMENT_ENV = "XDRIP2GCP_FS_DOCUMENT"
 SECRET_ENV = "NIGHTSCOUT_SECRET"
 HEADER_ENV = "XDRIP2GCP_AUTH_HEADER"
 MAX_BYTES_ENV = "XDRIP2GCP_MAX_REQUEST_BYTES"
@@ -68,7 +68,7 @@ PROTO_TYPES = {
 # message class are all worth keeping warm.
 _handler: bq_core.Handler | None = None
 _write_client: bigquery_storage_v1.BigQueryWriteClient | None = None
-_query_client: bigquery.Client | None = None
+_firestore_client: firestore.Client | None = None
 _message_class: Any = None
 
 
@@ -85,6 +85,10 @@ def _require_env(name: str) -> str:
 
 def _table_id(table_env: str) -> str:
     return f"{_require_env(PROJECT_ENV)}.{_require_env(DATASET_ENV)}.{_require_env(table_env)}"
+
+
+def _document_path() -> str:
+    return f"{_require_env(COLLECTION_ENV)}/{_require_env(DOCUMENT_ENV)}"
 
 
 # --------------------------------------------------------------------------
@@ -194,42 +198,51 @@ def _append_rows(rows: Sequence[Mapping[str, Any]]) -> None:
         stream.close()
 
 
-def _query_runner() -> bigquery.Client:
-    global _query_client
-    if _query_client is None:
-        _query_client = bigquery.Client(project=_require_env(PROJECT_ENV))
-    return _query_client
-
-
-def _update_latest(rows: Sequence[Mapping[str, Any]]) -> bool:
-    """Fold the new readings into the latest-readings table.
-
-    Reports failure rather than raising: the table is derived from data already
-    safely appended, so the request has succeeded either way and the next
-    upload will reconcile it.
-    """
-    if not rows:
-        return True
-
-    table = f"`{_table_id(LATEST_ENV)}`"
-    keep = int(os.environ.get(LATEST_ROWS_ENV, "2"))
-    sql = bq_core.merge_latest_sql(table, len(rows), keep)
-    parameters = [
-        bigquery.ScalarQueryParameter(name, type_, value)
-        for name, type_, value in bq_core.merge_parameters(rows)
-    ]
-
-    try:
-        job = _query_runner().query(
-            sql,
-            job_config=bigquery.QueryJobConfig(query_parameters=parameters),
-            location=os.environ.get(LOCATION_ENV) or None,
+def _firestore() -> firestore.Client:
+    global _firestore_client
+    if _firestore_client is None:
+        name = _require_env(DATABASE_ENV)
+        # The client spells the default database as None, not by its name.
+        _firestore_client = firestore.Client(
+            project=_require_env(PROJECT_ENV),
+            database=None if name == "(default)" else name,
         )
-        job.result()
-        return True
-    except Exception:  # noqa: BLE001 - derived state; log and carry on
-        print(f"latest-readings update failed:\n{traceback.format_exc()}")
+    return _firestore_client
+
+
+@firestore.transactional
+def _replace_if_newer(transaction, reference, document: Mapping[str, Any]) -> bool:
+    """Overwrite the published document unless it already holds a newer reading.
+
+    The read and the write are in one transaction because two uploads can be in
+    flight at once — xDrip retries a reading it thinks failed while sending the
+    next one — and a lost update here would leave a stale value on display until
+    the following reading arrived. Firestore retries the transaction itself if
+    the document changes underneath it.
+    """
+    snapshot = reference.get(transaction=transaction)
+    stored = snapshot.to_dict() if snapshot.exists else None
+    if not bq_core.supersedes(document, stored):
         return False
+    transaction.set(reference, dict(document))
+    return True
+
+
+def _publish_current(document: Mapping[str, Any]) -> str:
+    """Publish the reading as the current value.
+
+    Reports what happened rather than raising: the reading it describes is
+    already in BigQuery, so the request has succeeded either way, and the next
+    upload publishes again five minutes later.
+    """
+    try:
+        client = _firestore()
+        reference = client.document(_document_path())
+        replaced = _replace_if_newer(client.transaction(), reference, document)
+        return "updated" if replaced else "stale"
+    except Exception:  # noqa: BLE001 - derived state; log and carry on
+        print(f"publishing the current reading failed:\n{traceback.format_exc()}")
+        return "failed"
 
 
 # --------------------------------------------------------------------------
@@ -242,9 +255,10 @@ def _build_handler() -> bq_core.Handler:
     return bq_core.Handler(
         secret_payload=payload,
         appender=_append_rows,
-        latest_updater=_update_latest,
+        publisher=_publish_current,
         timezone_name=_require_env(TIMEZONE_ENV),
         entries_table=_table_id(ENTRIES_ENV),
+        current_path=_document_path(),
         header_name=os.environ.get(HEADER_ENV, "api-secret"),
         max_request_bytes=int(os.environ.get(MAX_BYTES_ENV, "1048576")),
     )

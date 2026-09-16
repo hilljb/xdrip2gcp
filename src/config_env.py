@@ -63,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         "XDRIP2GCP_DATASET": config.dataset_id,
         "XDRIP2GCP_ENTRIES": config.entries_table_id,
         "XDRIP2GCP_CURRENT": config.current_view_id,
-        "XDRIP2GCP_LATEST": config.latest_table_id,
+        "XDRIP2GCP_FS_DOCUMENT": config.firestore.path,
     }
 
     urls: dict[str, str | None] = {"XDRIP2GCP_URL": None, "XDRIP2GCP_BQ_URL": None}
