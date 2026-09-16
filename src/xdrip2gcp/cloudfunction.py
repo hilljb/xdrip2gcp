@@ -43,14 +43,15 @@ def function_env(config: Config) -> dict[str, str]:
 def bq_function_env(config: Config) -> dict[str, str]:
     """Environment the BigQuery-backed function reads at runtime."""
     bigquery = config.bigquery
+    firestore = config.firestore
     return {
         "XDRIP2GCP_BQ_PROJECT": config.project_id,
         "XDRIP2GCP_BQ_DATASET": bigquery.dataset,
         "XDRIP2GCP_BQ_ENTRIES_TABLE": bigquery.entries_table,
-        "XDRIP2GCP_BQ_LATEST_TABLE": bigquery.latest_table,
-        "XDRIP2GCP_BQ_LATEST_ROWS": str(bigquery.latest_rows),
         "XDRIP2GCP_BQ_TIMEZONE": bigquery.timezone,
-        "XDRIP2GCP_BQ_LOCATION": config.bigquery_location,
+        "XDRIP2GCP_FS_DATABASE": firestore.database,
+        "XDRIP2GCP_FS_COLLECTION": firestore.collection,
+        "XDRIP2GCP_FS_DOCUMENT": firestore.document,
         "XDRIP2GCP_AUTH_HEADER": config.auth.header_name,
         "XDRIP2GCP_MAX_REQUEST_BYTES": str(config.auth.max_request_bytes),
     }

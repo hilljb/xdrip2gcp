@@ -1,18 +1,21 @@
 #!/usr/bin/env python
-"""Prepare the BigQuery side of Stage 5: dataset, tables, view and identity.
+"""Prepare the BigQuery side of Stage 5: dataset, table, view and identity.
 
 Safe to run repeatedly. A second run reports no-ops, and a column added to
-`bq_core.SCHEMA` is applied to the existing tables rather than needing a
+`bq_core.SCHEMA` is applied to the existing table rather than needing a
 migration.
 
-Nothing here sets an expiration of any kind, and nothing here can delete data:
-the function's identity gets a custom role that can append and read but not
-drop a table.
+Nothing here sets an expiration of any kind, and the identity this grants can
+only append: the custom role carries no delete, no query and no read.
+
+The current reading is not here; it is one Firestore document, provisioned by
+`setup_firestore.py`.
 
 Run from the repo root:
 
     python src/setup_bigquery.py
     python src/setup_bigquery.py --dry-run
+    python src/setup_bigquery.py --drop-table entries_latest
 """
 
 from __future__ import annotations
@@ -33,9 +36,9 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="show what would be created, change nothing"
     )
     parser.add_argument(
-        "--reconcile-latest",
-        action="store_true",
-        help="rebuild the latest-readings table from the full history (scans the raw table)",
+        "--drop-table",
+        metavar="NAME",
+        help="delete a table in the dataset by name, for retiring one the design has moved past",
     )
     args = parser.parse_args(argv)
 
@@ -55,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"project   {config.project_id}")
     print(f"dataset   {config.dataset_id} in {config.bigquery_location}")
-    print(f"tables    {config.bigquery.entries_table}, {config.bigquery.latest_table}")
+    print(f"table     {config.bigquery.entries_table}")
     print(f"view      {config.bigquery.current_view}")
     print(f"identity  {config.bq_runtime_service_account}")
     print(f"role      {config.bq_role_name}")
@@ -76,9 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     for result in bigquery.ensure_dataset_objects(config):
         print(f"  [{result.marker}] {result}")
 
-    if args.reconcile_latest:
-        print("\nrepair")
-        result = bigquery.reconcile_latest(config)
+    if args.drop_table:
+        print("\nretire")
+        result = bigquery.drop_table(config, args.drop_table)
         print(f"  [{result.marker}] {result}")
 
     facts = bigquery.summary(config)

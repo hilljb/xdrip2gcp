@@ -602,26 +602,28 @@ What this stage built:
     * **Both clocks are stored, never computed**: `reading_time_utc` alongside
       `reading_time_local` (Mountain wall clock), each with its date, plus `local_offset` and
       `local_zone` so the `MDT`/`MST` in effect is a column rather than an inference.
-* A small `entries_latest` table holding **only the two most recent readings**, maintained by one
-  `MERGE` per upload that reads nothing but itself. Measured at exactly 10 MiB billed per upload,
-  flat forever, for the reasons in 5.4.
+* **The current reading is published to one Firestore document**, `current/entries`, rather than
+  kept in a small BigQuery table. Asking a warehouse for a single value is the one thing it does
+  expensively; 5.4 is the measurement that led here. The write is conditional, so a reading that
+  arrives late can never drag "now" backwards.
 * **Nothing expires.** No dataset default expiration, no partition expiration, and the function's
-  identity holds a custom role that cannot delete a table — so the endpoint has no authority to
+  identity holds custom roles that cannot delete anything — so the endpoint has no authority to
   rotate its own history out of existence.
 * Idempotent and tested. Re-running the setup and deploy scripts reports no-ops, and re-posting a
-  reading neither duplicates it in the view nor changes `entries_latest`. Verification readings
+  reading neither duplicates it in the view nor moves the published value. Verification readings
   are marked `device = 'xdrip2gcp-test'` so they can be told apart from real data. By choice this
   stage has offline tests only, covering reading identity, the row mapping, the daylight-saving
-  edge cases and the generated SQL; there is no test dataset, and correctness on GCP was
+  edge cases and the conditional publish; there is no test dataset, and correctness on GCP was
   confirmed with the earlier stages and `show_latest.py`.
-* Naming and configuration follow the existing conventions: a `[bigquery]` and a `[function_bq]`
-  section in `resources/config.toml`, with anything instance-specific staying in the git-ignored
-  `resources/config.local.toml`.
+* Naming and configuration follow the existing conventions: `[bigquery]`, `[firestore]` and
+  `[function_bq]` sections in `resources/config.toml`, with anything instance-specific staying in
+  the git-ignored `resources/config.local.toml`.
 
 Three new dependencies, all of them only inside the deployed function's own `requirements.txt`
-(`google-cloud-bigquery-storage` for the appends, `google-cloud-bigquery` for the `MERGE`, and
-`tzdata` because a slim runtime image cannot be assumed to ship a zone database); nothing was
-added to the conda environment, and the offline tests still drive stdlib-only code.
+(`google-cloud-bigquery-storage` for the appends, `google-cloud-firestore` for the current value,
+and `tzdata` because a slim runtime image cannot be assumed to ship a zone database); nothing was
+added to the conda environment, and both the offline tests and everything this repo runs locally
+are still stdlib-only.
 
 ### 5.0 Decisions taken before building
 
@@ -638,8 +640,12 @@ Seven questions were settled first, because each would have been expensive to re
 * **Duplicates are collapsed at read time, not prevented at write time.** See 5.2.
 * **Partitioned by UTC date, clustered by local date.** Both are stored, so a query in either
   frame prunes.
-* **The two-row table is maintained by a MERGE against itself.** See 5.4, which is mostly about
-  what this costs.
+* **The current value does not live in BigQuery.** It was going to be a two-row table maintained
+  by a `MERGE` against itself; 5.4 is what that would have cost and why one Firestore document is
+  the better shape. Firestore over the Realtime Database because a Cloud Function writes it
+  through an ordinary Google Cloud client with ordinary Google Cloud IAM, where the Realtime
+  Database would have added the Firebase Admin SDK and a second access-control model (rules
+  deployed with the Firebase CLI) to a project otherwise managed entirely with `gcloud`.
 * **`treatments` and anything else is accepted and dropped**, rather than 404'd, so the phone
   neither retries nor fills its log with errors.
 * **No live tests and no test dataset for this stage.** Offline tests cover the two things that
@@ -648,15 +654,25 @@ Seven questions were settled first, because each would have been expensive to re
 ### 5.1 Layout
 
 ```
-src/functions/nightscout_bq/main.py           Flask-to-core adapter, Storage Write API, MERGE (deployed)
-src/functions/nightscout_bq/bq_core.py        stdlib-only rows, schema and SQL (deployed + tested locally)
+src/functions/nightscout_bq/main.py           Flask-to-core adapter, Storage Write API, Firestore (deployed)
+src/functions/nightscout_bq/bq_core.py        stdlib-only rows, schema, SQL, current-value rules (deployed + tested)
 src/functions/nightscout_bq/requirements.txt  the function's own dependencies
-src/xdrip2gcp/bigquery.py                     dataset, tables, view, custom role
-src/setup_bigquery.py                         entry point: prepare BigQuery; --dry-run, --reconcile-latest
+src/xdrip2gcp/bigquery.py                     dataset, table, view, custom role
+src/xdrip2gcp/firestore.py                    database, custom role, and a dependency-free document read
+src/setup_bigquery.py                         entry point: prepare BigQuery; --dry-run, --drop-table
+src/setup_firestore.py                        entry point: prepare Firestore; --dry-run, --show
 src/deploy_bq_function.py                     entry point: secret + deploy; --show-url, --force
-src/show_latest.py                            entry point: newest reading, --source bigquery|bucket
-src/config_env.py                             entry point: shell exports, now including the BigQuery names
-test/test_bq_core.py                          offline: reading identity, local time, generated SQL
+src/show_latest.py                            entry point: newest reading, --source firestore|bigquery|bucket
+src/config_env.py                             entry point: shell exports, now including the Stage 5 names
+test/test_bq_core.py                          offline: reading identity, local time, the conditional publish
+```
+
+Three commands, in order, and all three converge on no-ops:
+
+```bash
+python src/setup_bigquery.py     # dataset, table, view, append-only identity
+python src/setup_firestore.py    # the database the current value lives in
+python src/deploy_bq_function.py # the function itself
 ```
 
 The BigQuery function does **not** carry its own copy of `nightscout_core.py`. It imports it, and
@@ -689,8 +705,10 @@ The arrangement:
   retry is what replaces the bucket as a safety net on this path, and it is safe precisely
   because the view collapses whatever the retry adds.
 
-A batch that contains the same reading twice is collapsed in Python before the SQL runs, because
-MERGE refuses a source that matches one target row more than once.
+A batch that contains the same reading twice is still collapsed in Python before anything is
+written. Duplicate rows would be harmless in an append-only table, but collapsing them keeps the
+row count in the response honest and makes "which of these is newest", the question the current
+value depends on, one with a single answer.
 
 ### 5.3 Both clocks are stored, not computed
 
@@ -708,55 +726,84 @@ The zone is `[bigquery].timezone` in config rather than hardcoded, validated at 
 the IANA database, and `tzdata` is in the function's requirements rather than trusting the
 runtime image to ship a zone database.
 
-### 5.4 The two-row table, and what it costs
+### 5.4 The current value, and why it is not in BigQuery
 
-`entries_latest` holds only the newest readings, and the interesting question was how much it
-costs to keep it that way on every upload. The obvious implementation — rebuild it from the
-history with `ORDER BY ... LIMIT 2` — is the wrong shape: `ORDER BY`/`LIMIT` prunes no
-partitions and the dedupe window function forces a pass over all of them, so every upload would
-scan the entire history. At 288 readings a day and roughly 440 bytes a row that is about 400 GB a
-month in year one, growing linearly and crossing the 1 TiB monthly free allowance in year three.
+The requirement was a small, cheap place to read the newest reading from while the day goes on.
+The first design was a two-row `entries_latest` table, and pricing it out is what moved it out of
+BigQuery altogether.
 
-So the function never reads the history at all. It already holds the reading it just wrote, and
-the only other thing "the two most recent" depends on is the two rows already there, so one
-`MERGE` against that table alone does the whole job: combine its current contents with the new
-rows, rank them, keep the top two, and `WHEN NOT MATCHED BY SOURCE THEN DELETE` the rest.
+The obvious implementation — rebuild the small table from the history with `ORDER BY ... LIMIT 2`
+— is the wrong shape: `ORDER BY`/`LIMIT` prunes no partitions and the dedupe window function
+forces a pass over all of them, so every upload would scan the entire history. At 288 readings a
+day and roughly 440 bytes a row that is about 400 GB a month in year one, growing linearly and
+crossing the 1 TiB monthly free allowance in year three.
 
-Measured, not estimated. Each such statement bills **10,485,760 bytes — exactly the 10 MiB
-minimum BigQuery charges per table referenced — while processing 38 bytes.** That is about 86 GB
-a month, 8% of the free allowance, and it stays there however many years of readings accumulate.
+That is avoidable. The function already holds the reading it just wrote, and the only other input
+to "the two most recent" is the two rows already there, so a `MERGE` against that table alone does
+the job without reading the history: combine its contents with the new rows, rank, keep the top
+two, `WHEN NOT MATCHED BY SOURCE THEN DELETE` the rest. Measured rather than estimated, each such
+statement bills **10,485,760 bytes — exactly the 10 MiB minimum BigQuery charges per table
+referenced — while processing 38 bytes**, or about 86 GB a month, flat forever.
 
-Two behaviours were verified directly before the code was written around them:
+Flat forever, but not free, and that 10 MiB floor is the point. BigQuery bills the same minimum
+per table per query whether one row is wanted or a hundred thousand, which makes "what is the
+value right now" the one question a warehouse answers badly. Every read by a dashboard or a widget
+would pay it too. So the current reading is not stored in BigQuery at all:
 
-* Replaying a reading leaves the table byte-identical.
-* A week-late reading does not displace newer rows; it loses the ranking, as it should.
+* The function publishes it to **one Firestore document**, `current/entries`, overwritten in place.
+  At 288 writes a day that is about 1.4% of Firestore's free allowance of 20,000 document writes
+  per day; the free tier also covers 50,000 reads a day, which is a reader polling every two
+  seconds around the clock. In practice a reader should not poll at all — Native mode supports
+  realtime listeners, so it can be pushed each new value.
+* The document carries what a reader needs and nothing more: `sgv`, `delta`, `direction`,
+  `device`, the reading's UTC timestamp, its epoch milliseconds, and the local wall clock as text
+  beside `local_zone` and `local_offset`. Local time is text because Firestore has no `DATETIME`,
+  and a naive datetime would be stored as a timestamp and read back as UTC, silently wrong by
+  however many hours Denver is behind.
+* **The write is conditional.** The newest reading *received* is not the newest reading: xDrip
+  resends, and a batch queued during an outage arrives carrying old timestamps. So the publish
+  runs in a transaction that compares `reading_epoch_ms` against what is already there and leaves
+  a newer value alone. The transaction, rather than a bare compare-and-set, is because two
+  uploads can be in flight at once — a retry going out alongside the next reading — and a lost
+  update would leave a stale value on display for five minutes. Equal timestamps do overwrite, so
+  a replay refreshes rather than being rejected.
+* **Failure never fails the request.** The reading is already in BigQuery by then, so the response
+  reports what happened in `x-xdrip2gcp-current` — `updated`, `stale` or `failed` — and the next
+  upload publishes again five minutes later. There is no repair step to run and no derived table
+  that can be left inconsistent.
 
-DML is also excluded from the 1,500-table-modifications-per-day limit that a `CREATE OR REPLACE`
-would count against, so a backlog flush after the phone has been offline for days cannot exhaust
-it. The rate limit that does apply is 25 statements per 10 seconds per table, against one upload
-every five minutes.
-
-Failure to update this table never fails the request. It is derived state: the reading is already
-safely in the raw table, and the next upload reconciles it. `setup_bigquery.py --reconcile-latest`
-rebuilds it from the full history if it ever needs repairing — that one *does* scan the raw table,
-which is the cost the MERGE exists to avoid paying routinely.
+Removing the `MERGE` had a second effect worth recording: the function no longer runs a query at
+all, so its BigQuery role lost `jobs.create` and every read permission. See 5.5.
 
 ### 5.5 Permanence, enforced rather than configured
 
-No dataset default expiration, no partition expiration, and nothing in this repo issues a drop.
-The part that needed real thought was IAM: `roles/bigquery.dataEditor`, the obvious grant, can
-delete tables, which is exactly the authority a public endpoint should not have. So the function
-runs as `xdrip2gcp-bq-runtime` holding a custom role, `xdrip2gcpBigQueryWriter`, with five
-permissions and no delete among them:
+No dataset default expiration, no partition expiration, and nothing the function can reach issues
+a drop. The part that needed real thought was IAM: `roles/bigquery.dataEditor`, the obvious grant,
+can delete tables, which is exactly the authority a public endpoint should not have. So the
+function runs as `xdrip2gcp-bq-runtime` holding two custom roles, neither of which can delete
+anything:
 
 ```
-bigquery.datasets.get  bigquery.jobs.create  bigquery.tables.get
-bigquery.tables.getData  bigquery.tables.updateData
+xdrip2gcpBigQueryWriter   bigquery.tables.get  bigquery.tables.updateData
+xdrip2gcpCurrentWriter    datastore.databases.get  datastore.entities.get
+                          datastore.entities.create  datastore.entities.update
 ```
 
-The binding is project-level because `bigquery.jobs.create` is a project permission — a job is
-not owned by the dataset it reads. The dataset's location is fixed at creation and cannot be
-changed later, so it follows `[bucket].location` and the setup script prints it.
+The BigQuery role is two permissions because publishing the current value to Firestore left the
+function **append-only**: read the table's schema, append to it, nothing else. No `jobs.create`, so
+it cannot run a query; no `tables.getData`, so it cannot read back what it wrote. The Firestore
+role can create and overwrite a document but not delete one, and cannot delete or export a
+database. (Firestore's permissions are named `datastore.*` for historical reasons.)
+
+Both bindings are project-level rather than scoped to the dataset, which is looser than strictly
+necessary, but the permissions are narrow and the project holds nothing but this data.
+
+Two locations are fixed at creation and cannot be changed afterwards: the BigQuery dataset's and
+the Firestore database's. Both follow `[bucket].location`, and both setup scripts print what they
+found rather than assuming. Firestore additionally allows one free database per project and fixes
+its mode at creation, so `setup_firestore.py` reports an existing database instead of trying to
+reconcile one — and says so plainly if it finds one in Datastore mode, which cannot serve realtime
+listeners.
 
 ### 5.6 Schema
 
@@ -779,14 +826,14 @@ column of its own yet. Absent fields are stored as NULL rather than zero, which 
 protobuf descriptor the Storage Write API needs is generated as **proto2** — proto3's implicit
 presence would turn a missing `sgv` into a reading of 0.
 
-`bq_core.SCHEMA` is the single definition. The table DDL, the protobuf descriptor and the MERGE
-are all generated from it, so they cannot drift, and `setup_bigquery.py` applies a column added
-there to the existing tables with `ALTER TABLE ADD COLUMN IF NOT EXISTS` rather than needing a
-migration.
+`bq_core.SCHEMA` is the single definition. Both the table DDL and the protobuf descriptor are
+generated from it, so the wire format cannot drift from the table, and `setup_bigquery.py` applies
+a column added there to the existing table with `ALTER TABLE ADD COLUMN IF NOT EXISTS` rather than
+needing a migration.
 
-Values from the phone are bound as query parameters, never formatted into SQL. The `JSON` column
-is the one exception to the mechanism: a JSON column cannot take a bound parameter, so the
-document is bound as text and wrapped in `PARSE_JSON(...)` in the statement.
+No SQL carries a value from the phone. The only statements the function issues are the appends,
+which go over the Storage Write API as protobuf; the DDL in `setup_bigquery.py` names columns and
+tables and nothing else.
 
 ### 5.7 Point xDrip at it
 
@@ -799,8 +846,8 @@ eval "$(python src/config_env.py)"
 ```
 
 Alongside the Stage 3 variables that adds `XDRIP2GCP_BQ_URL`, `XDRIP2GCP_BQ_FUNCTION`,
-`XDRIP2GCP_DATASET`, `XDRIP2GCP_ENTRIES`, `XDRIP2GCP_CURRENT` and `XDRIP2GCP_LATEST`, so nothing
-below has to name a generated hostname.
+`XDRIP2GCP_DATASET`, `XDRIP2GCP_ENTRIES`, `XDRIP2GCP_CURRENT` and `XDRIP2GCP_FS_DOCUMENT`, so
+nothing below has to name a generated hostname.
 
 Then the connection string:
 
@@ -831,14 +878,18 @@ whenever you want to switch back for testing.
 Uploads of `treatments` and `devicestatus` can be left switched on. This endpoint accepts them
 with a 200 and stores nothing, which keeps the phone from retrying or logging errors.
 
-To verify, `show_latest.py` now reads either destination and defaults to BigQuery:
+To verify, `show_latest.py` reads all three destinations and defaults to the cheapest — the one
+Firestore document:
 
 ```bash
-python src/show_latest.py                      # newest reading, from entries_latest
-python src/show_latest.py --count 10           # the last ten, from the entries_current view
-python src/show_latest.py --raw                # the document as xDrip sent it
-python src/show_latest.py --source bucket      # the Stage 3 path, unchanged
+python src/show_latest.py                             # the current value, one document read
+python src/show_latest.py --raw                       # the whole published document
+python src/show_latest.py --source bigquery --count 10 # the last ten, from the entries_current view
+python src/show_latest.py --source bucket             # the Stage 3 path, unchanged
 ```
+
+`setup_firestore.py --show` prints the same document with the reading's age, if you would rather
+not think about which source you are asking.
 
 `show_requests.py` still answers the "is the phone reaching the endpoint at all" question, but
 against the Stage 3 function; for this one, read the logs directly:
@@ -853,41 +904,57 @@ And in the console, `BigQuery` → the dataset named by `$XDRIP2GCP_DATASET`.
 
 ### 5.8 Verified results
 
-Provisioning and deployment are both idempotent; a second run of each reports only no-ops.
+All three scripts are idempotent; a second run of each reports only no-ops, including
+`--drop-table` on a table that is already gone.
 
 The endpoint, probed live: `/status` and `/experiments/test` answer, a wrong secret gets 401, an
 entry with no timestamp gets 400 naming the fields it looked for, an unknown path gets 404 listing
-what is supported, and `devicestatus` and `treatments` get 200 with
-`x-xdrip2gcp-stored: ignored`. A stored reading returns headers reporting the table, the row
-count, and whether the latest-readings table was updated.
+what is supported, and `devicestatus` and `treatments` get 200 with `x-xdrip2gcp-stored: ignored`.
+A stored reading returns headers reporting the table, the row count, the document path, and what
+became of the current value.
 
-A test reading posted twice, then read back:
+The conditional publish, verified directly. A test reading back-dated two hours was accepted and
+published; a second one back-dated three hours was appended to the table but left the document
+untouched, down to its `updateTime`:
 
 ```
-$ python src/show_latest.py --count 5
+two hours old: 200                    three hours old: 200
+  x-xdrip2gcp-stored: appended          x-xdrip2gcp-stored: appended
+  x-xdrip2gcp-current: updated          x-xdrip2gcp-current: stale
+```
+
+Both appends succeeded under the reduced role, which is the practical proof that the function
+needs neither `jobs.create` nor any read permission. Five minutes later the phone's own reading
+superseded the test value with no intervention, which is the whole argument for not having a
+repair step.
+
+Eleven days of real running, 4 to 15 September: **3,045 rows appended, 3,037 distinct readings.**
+The eight extra rows are duplicate appends — some from the verification above, the rest xDrip
+resending on its own — collapsed by `entries_current` exactly as intended. The current value reads
+back four minutes old, from the phone:
+
+```
+$ python src/show_latest.py
 TIME (LOCAL)         ZONE  MG/DL  DELTA   DIRECTION   DEVICE
-2026-09-04 23:11:31  MDT   123    +1.5    Flat        xdrip2gcp-test
-2026-09-04 23:08:39  MDT   123    +1.5    Flat        xdrip2gcp-test
+2026-09-15 18:12:08  MDT   141    +0.0    Flat        xDrip-DexcomG5
 
-newest reading is 9 minutes old (from xdrip2gcp.cgm.entries_current)
+newest reading is 4 minutes old (from current/entries)
 ```
 
-Four raw rows, two distinct `reading_id`s, two rows from the view, two rows in `entries_latest`:
-the at-least-once append and the collapse both doing their jobs. The reading at 23:11 local on
-4 September is stored with `reading_date_utc = 2026-09-05` and `reading_date_local = 2026-09-04`,
-which is exactly why both dates are columns.
+The dataset now holds `entries` and the `entries_current` view, and nothing else; `entries_latest`
+was removed with `setup_bigquery.py --drop-table entries_latest`.
 
-171 tests pass: 132 offline, 39 live.
+175 tests pass: 136 offline, 39 live.
 
 Two things to know:
 
 * The `python314` runtime was the main risk here, since `google-cloud-bigquery-storage` pulls in
-  `protobuf` and `grpcio`. Cloud Build resolved them without trouble; no runtime downgrade was
-  needed.
-* The verification readings above are in the permanent table, marked `device = 'xdrip2gcp-test'`.
-  Rows can be excluded with `WHERE device != 'xdrip2gcp-test'`, or deleted outright — though not
-  for the first while after they are written, since rows recently added through the Storage Write
-  API resist DML until the streaming buffer flushes.
+  `protobuf` and `grpcio`, and `google-cloud-firestore` pulls in more of the same. Cloud Build
+  resolved them without trouble; no runtime downgrade was needed.
+* Eight rows in the permanent table are marked `device = 'xdrip2gcp-test'`. They can be excluded
+  with `WHERE device != 'xdrip2gcp-test'`, or deleted outright — though not for the first while
+  after they are written, since rows recently added through the Storage Write API resist DML until
+  the streaming buffer flushes.
 
 ### 5.9 Run a BigQuery query
 

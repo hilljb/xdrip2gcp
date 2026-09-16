@@ -1,9 +1,10 @@
 """Offline tests for the BigQuery function's core. These make no network calls.
 
-Stage 5 was built without live tests by choice, so these cover the two things
-that are genuinely easy to get wrong and impossible to eyeball later: the
-identity a reading resolves to, and what the local-time columns say during the
-hours when Mountain time is not a fixed offset from UTC.
+Stage 5 was built without live tests by choice, so these cover the things that
+are genuinely easy to get wrong and impossible to eyeball later: the identity a
+reading resolves to, what the local-time columns say during the hours when
+Mountain time is not a fixed offset from UTC, and whether a late-arriving
+reading can drag the published current value backwards.
 """
 
 from __future__ import annotations
@@ -198,39 +199,62 @@ class SqlTests(unittest.TestCase):
         self.assertIn(f"PARTITION BY {bq.IDENTITY_COLUMN}", body)
         self.assertIn(f"ORDER BY {bq.INGEST_COLUMN} DESC", body)
 
-    def test_merge_reads_only_the_table_it_maintains(self) -> None:
-        # This is the whole cost argument: referencing the entries table here
-        # would make every upload scan the accumulated history.
-        sql = bq.merge_latest_sql("`p.d.entries_latest`", row_count=1, keep=2)
-        self.assertEqual(sql.count("`p.d.entries_latest`"), 2)
-        self.assertNotIn("`p.d.entries`", sql)
-        self.assertIn("LIMIT 2", sql)
-        self.assertIn("WHEN NOT MATCHED BY SOURCE THEN DELETE", sql)
 
-    def test_merge_binds_every_value_as_a_parameter(self) -> None:
-        # A device name is attacker-controlled text as far as this code knows,
-        # so it must never be formatted into the statement.
-        rows = bq.build_rows([ENTRY], INGEST, DENVER)
-        sql = bq.merge_latest_sql("`t`", row_count=len(rows), keep=2)
-        parameters = bq.merge_parameters(rows)
+class CurrentValueTests(unittest.TestCase):
+    """The document published to Firestore as "the reading right now"."""
 
-        self.assertEqual(len(parameters), len(bq.SCHEMA))
-        for name, _, _ in parameters:
-            self.assertIn(f"@{name}", sql)
-        self.assertNotIn("xDrip-DexcomG5", sql)
+    def document(self, entry: dict) -> dict:
+        return bq.current_document(row(entry))
 
-    def test_json_column_is_bound_as_text_and_parsed(self) -> None:
-        sql = bq.merge_latest_sql("`t`", row_count=1, keep=2)
-        self.assertIn("PARSE_JSON(@r0_raw)", sql)
-        types = dict((name, type_) for name, type_, _ in bq.merge_parameters(bq.build_rows([ENTRY], INGEST, DENVER)))
-        self.assertEqual(types["r0_raw"], "STRING")
-        self.assertEqual(types["r0_reading_time_utc"], "TIMESTAMP")
-        self.assertEqual(types["r0_reading_date_utc"], "DATE")
+    def test_carries_what_a_reader_needs_and_not_the_warehouse_columns(self) -> None:
+        document = self.document(ENTRY)
+        self.assertEqual(document["sgv"], ENTRY["sgv"])
+        self.assertEqual(document["direction"], ENTRY["direction"])
+        self.assertEqual(document["device"], ENTRY["device"])
+        # The partition and cluster dates, the ingest time and the raw document
+        # exist to serve BigQuery; a reader asking for one value gets none of it.
+        for absent in ("reading_date_utc", "reading_date_local", "raw", "ingest_time"):
+            self.assertNotIn(absent, document)
 
-    def test_merge_scales_to_a_multi_reading_batch(self) -> None:
-        sql = bq.merge_latest_sql("`t`", row_count=3, keep=2)
-        self.assertEqual(sql.count("UNION ALL"), 3)
-        self.assertIn("@r2_reading_id", sql)
+    def test_local_time_is_text_beside_its_zone(self) -> None:
+        # Firestore has no DATETIME, and a naive datetime would be stored as a
+        # timestamp and read back as UTC, silently seven hours wrong.
+        document = self.document(ENTRY)
+        self.assertIsInstance(document["reading_time_local"], str)
+        # Seconds, not microseconds: this is the string a reader displays.
+        self.assertEqual(document["reading_time_local"], "2026-09-04 17:33:34")
+        self.assertIn(document["local_zone"], ("MST", "MDT"))
+        self.assertEqual(document["reading_time_utc"].tzinfo, timezone.utc)
+
+    def test_epoch_matches_the_reading_not_the_ingest(self) -> None:
+        document = self.document(ENTRY)
+        self.assertEqual(document[bq.CURRENT_EPOCH_FIELD], ENTRY["date"])
+
+    def test_first_reading_is_published(self) -> None:
+        self.assertTrue(bq.supersedes(self.document(ENTRY), None))
+        self.assertTrue(bq.supersedes(self.document(ENTRY), {}))
+
+    def test_a_newer_reading_replaces_an_older_one(self) -> None:
+        older = self.document(ENTRY)
+        newer = self.document(dict(ENTRY, date=ENTRY["date"] + 300_000))
+        self.assertTrue(bq.supersedes(newer, older))
+
+    def test_a_late_reading_never_moves_the_value_backwards(self) -> None:
+        # A batch queued during an outage arrives carrying old timestamps. It
+        # belongs in the history, but it is not "now".
+        current = self.document(ENTRY)
+        stale = self.document(dict(ENTRY, date=ENTRY["date"] - 3_600_000))
+        self.assertFalse(bq.supersedes(stale, current))
+
+    def test_a_replay_refreshes_rather_than_being_rejected(self) -> None:
+        document = self.document(ENTRY)
+        self.assertTrue(bq.supersedes(document, document))
+
+    def test_a_stored_document_without_an_epoch_is_replaced(self) -> None:
+        # Nothing should ever write one, but a hand-edited document must not be
+        # able to freeze the current value permanently.
+        self.assertTrue(bq.supersedes(self.document(ENTRY), {"sgv": 100}))
+        self.assertTrue(bq.supersedes(self.document(ENTRY), {bq.CURRENT_EPOCH_FIELD: "corrupt"}))
 
 
 if __name__ == "__main__":

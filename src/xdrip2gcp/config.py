@@ -59,6 +59,7 @@ class ServiceAccountConfig:
     build_role_project: str
     bq_runtime_id: str = "xdrip2gcp-bq-runtime"
     bq_role_id: str = "xdrip2gcpBigQueryWriter"
+    firestore_role_id: str = "xdrip2gcpCurrentWriter"
 
 
 @dataclass(frozen=True)
@@ -88,9 +89,22 @@ class BigQueryConfig:
     dataset: str
     entries_table: str
     current_view: str
-    latest_table: str
-    latest_rows: int
     timezone: str
+
+
+@dataclass(frozen=True)
+class FirestoreConfig:
+    """Where the single current reading is published."""
+
+    database: str
+    location: str
+    collection: str
+    document: str
+
+    @property
+    def path(self) -> str:
+        """The document's path within the database."""
+        return f"{self.collection}/{self.document}"
 
 
 @dataclass(frozen=True)
@@ -131,6 +145,7 @@ class Config:
     function_bq: FunctionConfig | None = None
     auth: AuthConfig | None = None
     bigquery: BigQueryConfig | None = None
+    firestore: FirestoreConfig | None = None
 
     @property
     def bucket_uri(self) -> str:
@@ -217,10 +232,27 @@ class Config:
         return self.table_id(self.bigquery.entries_table)
 
     @property
-    def latest_table_id(self) -> str:
-        if self.bigquery is None:
-            raise ConfigError("[bigquery] is missing from the configuration")
-        return self.table_id(self.bigquery.latest_table)
+    def firestore_location(self) -> str:
+        """The Firestore database's location, defaulting to the bucket's."""
+        if self.firestore is None:
+            raise ConfigError("[firestore] is missing from the configuration")
+        return self.firestore.location or self.location
+
+    @property
+    def firestore_document_path(self) -> str:
+        """The document's full resource path, as the REST API names it."""
+        if self.firestore is None:
+            raise ConfigError("[firestore] is missing from the configuration")
+        return (
+            f"projects/{self.project_id}/databases/{self.firestore.database}"
+            f"/documents/{self.firestore.path}"
+        )
+
+    @property
+    def firestore_role_name(self) -> str:
+        if self.service_accounts is None:
+            raise ConfigError("[service_accounts] is missing from the configuration")
+        return f"projects/{self.project_id}/roles/{self.service_accounts.firestore_role_id}"
 
     @property
     def current_view_id(self) -> str:
@@ -374,6 +406,7 @@ def load_config(
     function_bq = raw.get("function_bq", {})
     auth = raw.get("auth", {})
     bigquery = raw.get("bigquery", {})
+    firestore = raw.get("firestore", {})
 
     project_id = str(project.get("id", "")).strip()
     if not project_id:
@@ -403,10 +436,6 @@ def load_config(
     lifecycle_age_days = int(bucket.get("lifecycle_age_days", 0))
     if lifecycle_age_days < 0:
         raise ConfigError("[bucket].lifecycle_age_days may not be negative")
-
-    latest_rows = int(bigquery.get("latest_rows", 2))
-    if latest_rows < 1:
-        raise ConfigError("[bigquery].latest_rows must be at least 1")
 
     timezone_name = str(bigquery.get("timezone", "America/Denver")).strip()
     if not timezone_name:
@@ -439,6 +468,7 @@ def load_config(
             build_role_project=str(accounts.get("build_role_project", "roles/cloudbuild.builds.builder")),
             bq_runtime_id=str(accounts.get("bq_runtime_id", "xdrip2gcp-bq-runtime")),
             bq_role_id=str(accounts.get("bq_role_id", "xdrip2gcpBigQueryWriter")),
+            firestore_role_id=str(accounts.get("firestore_role_id", "xdrip2gcpCurrentWriter")),
         ),
         function=FunctionConfig(
             name=str(function.get("name", "xdrip2gcp-nightscout-test")),
@@ -467,9 +497,13 @@ def load_config(
             dataset=str(bigquery.get("dataset", "cgm")).strip(),
             entries_table=str(bigquery.get("entries_table", "entries")).strip(),
             current_view=str(bigquery.get("current_view", "entries_current")).strip(),
-            latest_table=str(bigquery.get("latest_table", "entries_latest")).strip(),
-            latest_rows=latest_rows,
             timezone=timezone_name,
+        ),
+        firestore=FirestoreConfig(
+            database=str(firestore.get("database", "(default)")).strip(),
+            location=str(firestore.get("location", "")).strip(),
+            collection=str(firestore.get("collection", "current")).strip("/"),
+            document=str(firestore.get("document", "entries")).strip("/"),
         ),
         auth=AuthConfig(
             header_name=str(auth.get("header_name", "api-secret")),

@@ -10,7 +10,7 @@ which includes the shared `nightscout_core` module even though it lives in the
 other function's directory: it is copied in at deploy time, and its contents
 are part of the hash.
 
-Run from the repo root, after src/setup_bigquery.py:
+Run from the repo root, after src/setup_bigquery.py and src/setup_firestore.py:
 
     python src/deploy_bq_function.py
     python src/deploy_bq_function.py --show-url
@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from xdrip2gcp import bigquery, cloudfunction, gcloud, secretmanager  # noqa: E402
+from xdrip2gcp import bigquery, cloudfunction, firestore, gcloud, secretmanager  # noqa: E402
 from xdrip2gcp.config import ConfigError, ensure_password, load_config  # noqa: E402
 from xdrip2gcp.function_source import shared_module_paths  # noqa: E402
 
@@ -57,11 +57,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"function  {function.name} in {config.function_bq_region}")
     print(f"identity  {config.bq_runtime_service_account}")
     print(f"dataset   {config.entries_table_id}")
+    print(f"current   {config.firestore.path}")
     print(f"shared    {', '.join(path.name for path in shared)}")
 
     if not bigquery.dataset_exists(config):
         print(
             f"\n{config.dataset_id} does not exist; run src/setup_bigquery.py first",
+            file=sys.stderr,
+        )
+        return 4
+
+    if firestore.database_metadata(config) is None:
+        print(
+            "\nthere is no Firestore database; run src/setup_firestore.py first",
             file=sys.stderr,
         )
         return 4

@@ -5,23 +5,23 @@
 "what actually landed". Handy after changing anything on the phone, and as a
 quick check that a reading is as fresh as it should be.
 
-Both destinations are readable, since the phone can be pointed at either
+Every destination is readable, since the phone can be pointed at either
 endpoint:
 
-    --source bigquery  (default)  the Stage 5 dataset
-    --source bucket               the Stage 3 bucket
+    --source firestore  (default)  the published current reading, one document
+    --source bigquery              the Stage 5 dataset, for history
+    --source bucket                the Stage 3 bucket
 
-Each is read the cheap way. In the bucket, object names carry the reading's own
+Each is read the cheap way, which is the reason the default is Firestore: one
+document read answers "what is it now", where the same question put to BigQuery
+bills a 10 MiB minimum. In the bucket, object names carry the reading's own
 epoch-millisecond timestamp, so the newest data is found by listing names
-rather than by reading every object. In BigQuery, a request for no more
-readings than the latest-readings table holds is answered from that table,
-which is two rows, rather than from the history; the footer says which table
-answered.
+rather than by reading every object.
 
 Run from the repo root:
 
     python src/show_latest.py
-    python src/show_latest.py --count 10
+    python src/show_latest.py --source bigquery --count 10
     python src/show_latest.py --source bucket --collection devicestatus --raw
 
 Exit codes: 4 means nothing is stored there yet.
@@ -39,7 +39,7 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from xdrip2gcp import bigquery, bucket, gcloud  # noqa: E402
+from xdrip2gcp import bigquery, bucket, firestore, gcloud  # noqa: E402
 from xdrip2gcp.config import Config, ConfigError, load_config  # noqa: E402
 from xdrip2gcp.function_source import core_module  # noqa: E402
 
@@ -194,7 +194,7 @@ WINDOWS_DAYS = (2, 30, None)
 
 
 def bigquery_rows(config: Config, count: int) -> tuple[list[dict[str, Any]], str]:
-    """The newest readings from BigQuery, and the name of the table read.
+    """The newest readings from BigQuery, and the name of the source read.
 
     Both timestamps are already stored, so this converts nothing: the local
     wall clock and the zone it was in are columns, which is the whole point of
@@ -206,18 +206,6 @@ def bigquery_rows(config: Config, count: int) -> tuple[list[dict[str, Any]], str
         "UNIX_MILLIS(reading_time_utc) AS utc_ms, "
         "TO_JSON_STRING(raw) AS raw_text"
     )
-
-    # The latest-readings table exists precisely to answer this question
-    # without touching the history, so use it when it can.
-    if count <= config.bigquery.latest_rows:
-        table = config.bigquery.latest_table
-        rows = bigquery.query_rows(
-            config,
-            f"SELECT {columns} FROM {config.quoted_table(table)} "
-            f"ORDER BY reading_time_utc DESC LIMIT {count}",
-        )
-        if rows:
-            return rows, config.table_id(table)
 
     view = config.quoted_table(config.bigquery.current_view)
     for days in WINDOWS_DAYS:
@@ -270,20 +258,52 @@ def report_bigquery(config: Config, count: int, raw: bool) -> int:
     return 0
 
 
+def report_firestore(config: Config, raw: bool) -> int:
+    """Print the published current reading: one document, one read."""
+    document = firestore.get_document(config)
+    if document is None:
+        print(f"nothing published at {config.firestore.path} yet", file=sys.stderr)
+        return 4
+
+    if raw:
+        print(json.dumps(document, indent=2, sort_keys=True))
+    else:
+        print_bigquery_rows(
+            [
+                {
+                    "local_text": document.get("reading_time_local"),
+                    "local_zone": document.get("local_zone"),
+                    "sgv": document.get("sgv"),
+                    "delta": document.get("delta"),
+                    "direction": document.get("direction"),
+                    "device": document.get("device"),
+                }
+            ]
+        )
+
+    age = firestore.document_age_seconds(document)
+    print()
+    if age is None:
+        print(f"published reading carries no timestamp ({config.firestore.path})")
+    else:
+        print(f"newest reading is {human_age(age)} (from {config.firestore.path})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     core = core_module()
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--source",
-        default="bigquery",
-        choices=("bigquery", "bucket"),
-        help="where to read from (default: bigquery)",
+        default="firestore",
+        choices=("firestore", "bigquery", "bucket"),
+        help="where to read from (default: firestore, the current value)",
     )
     parser.add_argument(
         "--collection",
         default="entries",
         choices=core.WRITABLE_COLLECTIONS,
-        help="which collection to read; bucket only, BigQuery stores entries alone",
+        help="which collection to read; bucket only, the other sources hold entries alone",
     )
     parser.add_argument("--count", type=int, default=1, help="how many documents to show")
     parser.add_argument("--raw", action="store_true", help="print stored JSON instead of a table")
@@ -303,9 +323,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot reach GCP: {reason}", file=sys.stderr)
         return 3
 
+    if args.source != "bucket" and args.collection != "entries":
+        parser.error(f"{args.source} stores only entries; use --source bucket for other collections")
+
+    if args.source == "firestore":
+        if args.count != 1:
+            parser.error("firestore holds one reading; use --source bigquery for more")
+        try:
+            return report_firestore(config, args.raw)
+        except gcloud.GcloudError as error:
+            print(f"reading the current value failed: {error}", file=sys.stderr)
+            return 5
+
     if args.source == "bigquery":
-        if args.collection != "entries":
-            parser.error("BigQuery stores only entries; use --source bucket for other collections")
         if not gcloud.bq_available():
             print("the bq CLI is not on PATH; it ships with the Cloud SDK", file=sys.stderr)
             return 3

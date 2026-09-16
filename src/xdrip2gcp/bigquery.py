@@ -27,21 +27,19 @@ from .config import Config
 from .function_source import bq_core_module
 from .gcloud import GcloudError, bq_query, run, run_bq
 
-# What the runtime identity needs and nothing else: create query jobs (the
-# MERGE that maintains the latest-readings table), read the small table it
-# maintains, and append rows. Notably absent: tables.delete, tables.create,
-# datasets.delete.
+# What the runtime identity needs and nothing else: read the table's schema and
+# append rows to it. The function is append-only now that the current reading is
+# published to Firestore instead of maintained in a table here, so it needs no
+# query jobs and no read access at all. Notably absent: tables.delete,
+# tables.create, tables.getData, jobs.create, datasets.delete.
 BQ_ROLE_PERMISSIONS = (
-    "bigquery.datasets.get",
-    "bigquery.jobs.create",
     "bigquery.tables.get",
-    "bigquery.tables.getData",
     "bigquery.tables.updateData",
 )
 
 BQ_ROLE_TITLE = "xdrip2gcp BigQuery writer"
 BQ_ROLE_DESCRIPTION = (
-    "Append readings and maintain the latest-readings table. Cannot delete tables or datasets."
+    "Append readings to the entries table. Cannot read, query, or delete anything."
 )
 
 
@@ -125,24 +123,6 @@ def ensure_entries_table(config: Config) -> ActionResult:
         True,
         f"created {config.table_id(table)}, partitioned by {core.PARTITION_COLUMN}, "
         f"clustered by {core.CLUSTER_COLUMN}",
-    )
-
-
-def ensure_latest_table(config: Config) -> ActionResult:
-    """Create the small table holding only the most recent readings."""
-    core = _core()
-    table = config.bigquery.latest_table
-    existed = table_metadata(config, table) is not None
-
-    bq_query(
-        config,
-        core.create_latest_ddl(config.quoted_table(table), config.bigquery.latest_rows),
-        location=config.bigquery_location,
-    )
-    if existed:
-        return ActionResult(False, f"table {config.table_id(table)} already exists")
-    return ActionResult(
-        True, f"created {config.table_id(table)} for the {config.bigquery.latest_rows} newest readings"
     )
 
 
@@ -264,10 +244,9 @@ def ensure_bq_role(config: Config) -> ActionResult:
 def ensure_identity(config: Config) -> list[ActionResult]:
     """Create the BigQuery function's identity and grant it the custom role.
 
-    The binding is project-level because `bigquery.jobs.create` is a project
-    permission: a job is not owned by the dataset it reads. The role's other
-    permissions are narrow enough that this stays least-privilege in practice,
-    and the project holds nothing but this data.
+    The binding is project-level rather than on the dataset, which is looser
+    than it needs to be, but the role carries only "read this table's schema"
+    and "append to it" and the project holds exactly one dataset.
     """
     accounts = config.service_accounts
     results = [
@@ -282,42 +261,24 @@ def ensure_identity(config: Config) -> list[ActionResult]:
 
 
 def ensure_dataset_objects(config: Config) -> list[ActionResult]:
-    """Bring the dataset, its tables and its view to the configured state."""
+    """Bring the dataset, its table and its view to the configured state."""
     results = [ensure_dataset(config)]
     results.append(ensure_entries_table(config))
     results.append(ensure_columns(config, config.bigquery.entries_table))
-    results.append(ensure_latest_table(config))
-    results.append(ensure_columns(config, config.bigquery.latest_table))
     results.append(ensure_current_view(config))
     return results
 
 
-def reconcile_latest(config: Config) -> ActionResult:
-    """Rebuild the latest-readings table from the full history.
+def drop_table(config: Config, table: str) -> ActionResult:
+    """Delete a table, for retiring one the design has moved past.
 
-    The function maintains that table from the readings it sees, so it is
-    correct from the second upload onwards but knows nothing of readings that
-    landed while it was failing. This is the repair, and it is deliberately
-    not part of a normal run: unlike the function's MERGE, it scans the raw
-    table, which is the cost the MERGE exists to avoid paying every upload.
+    Deliberately not something the function's identity can do: this runs as the
+    operator, from a script, against a table named explicitly.
     """
-    bigquery = config.bigquery
-    latest = config.quoted_table(bigquery.latest_table)
-    view = config.quoted_table(bigquery.current_view)
-
-    bq_query(
-        config,
-        "BEGIN TRANSACTION;\n"
-        f"DELETE FROM {latest} WHERE TRUE;\n"
-        f"INSERT INTO {latest} SELECT * FROM {view} "
-        f"ORDER BY {_core().ORDER_COLUMN} DESC LIMIT {bigquery.latest_rows};\n"
-        "COMMIT TRANSACTION;",
-        location=config.bigquery_location,
-    )
-    # `rows` is a reserved keyword, so the alias cannot be the obvious one.
-    rows = query_rows(config, f"SELECT COUNT(*) AS row_count FROM {latest}")
-    count = int(rows[0]["row_count"]) if rows else 0
-    return ActionResult(True, f"rebuilt {config.latest_table_id} from history: {count} row(s)")
+    if table_metadata(config, table) is None:
+        return ActionResult(False, f"table {config.table_id(table)} is already gone")
+    run_bq(config, ["rm", "--table", "--force", _cli_table(config, table)])
+    return ActionResult(True, f"deleted table {config.table_id(table)}")
 
 
 def query_rows(config: Config, sql: str) -> list[dict[str, Any]]:
@@ -351,6 +312,5 @@ def summary(config: Config) -> dict[str, Any]:
         "clustered_by": clustering.get("fields") or [],
         "columns": existing_columns(config, bigquery.entries_table),
         "view": config.current_view_id,
-        "latest_table": config.latest_table_id,
         "expiration_time": entries.get("expirationTime"),
     }
