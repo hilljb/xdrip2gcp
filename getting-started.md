@@ -1,7 +1,8 @@
 # Getting started
 
 Setting this up from scratch: an empty GCP project at one end, glucose readings arriving in
-BigQuery and Firestore at the other. Expect about half an hour, most of it waiting for GCP.
+BigQuery, Firestore and Google Sheets at the other. Expect about half an hour, most of it waiting
+for GCP.
 
 This is the short version. [`agent/plan.md`](agent/plan.md) has the long one, stage by stage, and
 is where to look when something here is not enough — it is referenced by section below.
@@ -147,6 +148,8 @@ gcloud logging read \
 A request that stored a reading answers 200 with headers describing what happened —
 `x-xdrip2gcp-rows`, `x-xdrip2gcp-stored`, and `x-xdrip2gcp-current`, which reads `updated` when the
 current value moved, or `stale` when the reading was older than what was already published.
+`x-xdrip2gcp-sheet` reports the spreadsheet mirror from section 7, and says `skipped` until you set
+one up.
 
 ## 6. Read the data back
 
@@ -171,11 +174,32 @@ python src/show_latest.py --source bigquery --count 10
 SELECT reading_time_local, sgv, direction
 FROM `YOUR_PROJECT.cgm.entries_current`
 WHERE reading_date_local >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND device != 'xdrip2gcp-test'
 ORDER BY reading_time_utc DESC
 ```
 
 Both timestamps are stored rather than computed, so a query in local time needs no conversion.
 Filter on `reading_date_local` or `reading_date_utc` to prune partitions and keep queries cheap.
+
+### Excluding test readings
+
+The table is permanent and append-only, so **everything ever written during setup and verification
+is still in it**, including some deliberately absurd values. Expect to meet a reading or two of
+`sgv = 999`: an impossible number is how the timestamp logic gets tested without any risk of the row
+being mistaken for data. Every such row is marked, so one clause removes all of them:
+
+```sql
+WHERE device != 'xdrip2gcp-test'
+```
+
+Make that a habit in anything you build on this data — it belongs in your Looker Studio data source
+as a filter, not only in one-off queries. Note that `show_latest.py` does *not* apply it, on purpose:
+when you are checking whether the pipeline works, a test row is exactly what you want to see.
+
+**Filter on the device, never on the value.** It is tempting to write `WHERE sgv < 400` instead, and
+it will quietly throw away real data: a sensor genuinely does report into the 400s, and Dexcom's own
+error sentinels sit at 39 and below. `sgv >= 400 OR sgv <= 39` is a reasonable *flag* to show on a
+chart, but it is not a way to tell test rows from real ones.
 
 ### From your own code
 
@@ -203,13 +227,81 @@ directly from a browser or mobile app is a different path again: it needs Fireba
 project and security rules written, neither of which is set up here. Until then, server-side reads
 with a service account are the supported route.
 
+## 7. Optional: mirror the recent day into Google Sheets
+
+Worth doing if you plan to build Looker Studio dashboards. Looker issues a separate BigQuery query
+for every chart, which adds up over a day of refreshes; its Sheets connector does not. So the
+function can also keep a rolling 24 hours in a spreadsheet, for the charts you look at most.
+
+**Read this before you start, because this destination is not like the other two.** The BigQuery
+table and the Firestore document are resources *inside* your GCP project: the scripts create them,
+the project owns them, and deleting the project deletes them. A spreadsheet is not. It is an
+ordinary file **in your own Google Drive**, owned by your personal Google account, and it would
+outlive the project entirely.
+
+The project's only two contributions are that `sheets.googleapis.com` is enabled in it, so the API
+calls have somewhere to bill quota, and that the function's service account — a project-owned
+identity — is handed access to your file the same way a colleague would be. So this is the one part
+that cannot be scripted, and the only part where you grant access in Drive rather than in IAM.
+
+1. Create a blank spreadsheet **in My Drive**, not a shared drive, and rename a tab to `recent`.
+   Looker Studio cannot reach files on a shared drive. Name the file whatever you like — nothing in
+   this repo reads the name — but pick something that warns you off editing it by hand, because the
+   function overwrites the whole tab every five minutes.
+2. Copy its ID out of the URL. You do not choose the ID; Google assigns it when the file is created.
+   It is the long string between `/d/` and `/edit`:
+   `docs.google.com/spreadsheets/d/`**`1a2B3c...xYz`**`/edit`.
+3. Share it as **Editor** with the function's identity. `python src/deploy_bq_function.py` prints
+   the exact address; it looks like `xdrip2gcp-bq-runtime@YOUR_PROJECT.iam.gserviceaccount.com`.
+   Sheets grants access per file through Drive sharing, so no IAM role can substitute for this step.
+4. Record the ID and redeploy:
+
+```bash
+cat >> resources/config.local.toml <<'EOF'
+[sheets]
+spreadsheet_id = "YOUR_SPREADSHEET_ID"
+EOF
+
+python src/deploy_bq_function.py
+```
+
+Within five minutes the `recent` tab fills with the last 24 hours, newest first, under the columns
+`reading_time_local`, `reading_date_local`, `clock_time`, `sgv`, `delta`, `direction`, `device` and
+`reading_epoch_ms`. The whole block is rewritten on every upload: rows age out past 24 hours, and a
+reading xDrip resends or revises updates its own row rather than adding a second one. Anything you
+want to keep by hand belongs on a different tab.
+
+Two things to expect. The window only rotates when a reading arrives, so with the phone off the
+sheet keeps showing the window as it last stood. And if the mirror fails, the reading is still
+stored — `x-xdrip2gcp-sheet` says `failed` and the function's log holds the reason, which is almost
+always step 3.
+
+Because the file is yours rather than the project's, you can throw it away and start over at no
+cost: delete it, create another, and repeat steps 1 through 4 with the new ID. Nothing is lost,
+since every row in it is derived from BigQuery. For the same reason, keep nothing else in this
+file — the function clears and rewrites the tab, and Drive has no append-only permission that could
+stop it.
+
+### Connecting Looker Studio to it
+
+Create a data source, pick the **Google Sheets** connector, choose the file and the `recent`
+worksheet, and leave *Use first row as headers* on. Two settings are worth getting right: set data
+freshness to **Every 15 minutes**, which is the fastest the Sheets connector offers, and set data
+credentials to **Owner's Credentials** so that showing someone the dashboard does not require
+sharing the spreadsheet with them.
+
+Fifteen minutes is the one real cost of reading through Sheets instead of BigQuery, whose freshness
+goes down to a minute. It does not affect the shape of the day, a report's manual refresh bypasses
+the cache, and the genuinely live value is the Firestore document.
+
 ## Running the tests
 
 ```bash
 python -m unittest discover -s test -t . -v
 ```
 
-136 offline tests need nothing but Python. A further 39 talk to real GCP and are skipped
-automatically when `gcloud` cannot reach your project, so the same command works either way. Tests
-that write data mark it `device = 'xdrip2gcp-test'`, so it can always be told from real readings
-with `WHERE device != 'xdrip2gcp-test'`.
+149 offline tests need nothing but Python. A further 39 talk to real GCP and are skipped
+automatically when `gcloud` cannot reach your project, so the same command works either way.
+
+Anything the tests write is marked `device = 'xdrip2gcp-test'` and stays in the table forever, since
+it is append-only by design. Exclude it as shown in section 6.

@@ -8,13 +8,13 @@ Read this first, then the plan section for whatever you are about to touch.
 
 ## Current state
 
-Stages 1 through 5 are complete and running in production, taking real readings from a phone every
+Stages 1 through 6 are complete and running in production, taking real readings from a phone every
 five minutes. Two Cloud Functions are deployed:
 
 | Function | Destination | Purpose |
 | --- | --- | --- |
 | `xdrip2gcp-nightscout-test` | Cloud Storage bucket | Stage 3. Kept for testing; the phone is not pointed at it. |
-| `xdrip2gcp-nightscout-bq` | BigQuery + Firestore | Stage 5. The live path. |
+| `xdrip2gcp-nightscout-bq` | BigQuery + Firestore + Sheets | Stage 5, extended in Stage 6. The live path. |
 
 Both speak the same Nightscout REST dialect and share one credential, so moving the phone between
 them is only a URL change. **They are not meant to run in parallel**: xDrip clears its upload queue
@@ -41,7 +41,10 @@ state, compare, act only on a difference.
 
 **Test data is marked `device = 'xdrip2gcp-test'`.** The BigQuery table is permanent and append-only
 by design, so anything written during verification stays there forever. It can always be excluded
-with `WHERE device != 'xdrip2gcp-test'`.
+with `WHERE device != 'xdrip2gcp-test'`, and that is the only correct way to exclude it. Some test
+rows carry `sgv = 999` so that a row written to exercise timestamp logic can never be mistaken for
+data — but **do not filter on the value**: the real sensor has reported into the 460s, so a
+`WHERE sgv < 400` cleanup would silently discard genuine readings.
 
 **Instance-specific values are never committed.** No generated bucket suffix, no function hostname,
 no password. If you need one in a command, get it from `python src/config_env.py`.
@@ -170,6 +173,33 @@ batch queued during an outage arrives carrying old timestamps. The comparison ru
 Firestore transaction, since two uploads can be in flight at once and a lost update would leave a
 stale value on display for five minutes. Equal timestamps overwrite, so a replay refreshes.
 
+**The spreadsheet holds its own window.** Stage 6 mirrors the last 24 hours into Google Sheets,
+because Looker Studio issues one BigQuery query per chart and its Sheets connector does not. The
+window is under 300 rows, which is small enough that the function reads the sheet back on every
+upload, merges by reading time, drops what has aged out, and writes the block again. That is why no
+BigQuery read permission was restored for it: the sheet is the window's only storage.
+
+**The spreadsheet is not a project resource.** Worth being explicit, because it is the only one:
+`cgm.entries` and `current/entries` live inside the GCP project and are created by the setup
+scripts, while the spreadsheet is a file in the operator's personal Drive that the project merely
+has permission to write to. The project contributes two things and no more — `sheets.googleapis.com`
+enabled for quota, and the service account identity that the file is shared with. Nothing in this
+repo can create, find, or delete it, and it outlives the project.
+
+Three things about it differ from the other two destinations, and all three are deliberate:
+
+* **Access comes from Drive sharing, not IAM.** The identity is added as an Editor on the file.
+  No grant in this project can substitute for that, and Drive offers nothing narrower than Editor,
+  so this is the one write path in the system that could destroy what it writes to. The containment
+  is that the file is disposable: everything in it is derived from BigQuery.
+* **The token needs an explicit scope.** A `cloud-platform` token is rejected by the Sheets API with
+  `ACCESS_TOKEN_SCOPE_INSUFFICIENT`. `google.auth.default(scopes=[...spreadsheets])` works because a
+  gen2 function runs on Cloud Run, whose metadata server honours requested scopes — on Compute
+  Engine it would not. The corollary is that the sheet cannot be read from a laptop, since
+  `gcloud auth print-access-token` only mints `cloud-platform`.
+* **There is no transaction.** Sheets has no equivalent, so overlapping uploads can clobber a row.
+  That costs a gap in a chart, never a reading, and the next upload rewrites the window anyway.
+
 ## Identities and IAM
 
 The function runs as `xdrip2gcp-bq-runtime` holding two custom roles. `roles/bigquery.dataEditor`,
@@ -227,8 +257,13 @@ Collections other than `entries` are accepted with `x-xdrip2gcp-stored: ignored`
 so the phone neither retries nor fills its log with errors.
 
 Response headers on a stored reading: `x-xdrip2gcp-table`, `-rows`, `-documents`, `-stored`,
-`-reading-id`, `-current` (`updated`, `stale`, `failed` or `skipped`) and `-current-path`. These are
-how the live tests and manual probes assert behaviour; keep them accurate.
+`-reading-id`, `-current` (`updated`, `stale`, `failed` or `skipped`), `-current-path`, and
+`-sheet` (`updated`, `skipped` or `failed`). These are how the live tests and manual probes assert
+behaviour; keep them accurate.
+
+Note what is *not* a 5xx: neither the Firestore publish nor the Sheets mirror can fail the request.
+Both are derived from a reading that is already in BigQuery, and both are rewritten by the next
+upload, so they report in a header and the response stays a 200.
 
 ## Gotchas that cost real time
 
@@ -248,7 +283,7 @@ how the live tests and manual probes assert behaviour; keep them accurate.
 ## Verifying a change
 
 ```bash
-python -m unittest discover -s test -t . -v   # 136 offline, 39 live (skipped without gcloud)
+python -m unittest discover -s test -t . -v   # 149 offline, 39 live (skipped without gcloud)
 python src/setup_bigquery.py                  # must report only no-ops
 python src/setup_firestore.py                 # must report only no-ops
 python src/deploy_bq_function.py              # deploys only if something really changed
@@ -257,7 +292,8 @@ python src/show_latest.py --source bigquery --count 5
 ```
 
 A change is not finished until the setup scripts converge on no-ops and a real reading has landed
-in both destinations.
+in every destination. The spreadsheet is the one that cannot be checked from here, for the scope
+reason above; probe the endpoint and read `x-xdrip2gcp-sheet` instead.
 
 ## Known gaps
 
@@ -274,4 +310,12 @@ Not bugs — decisions deferred, and the obvious next work:
 * **No live tests for the Stage 5 path**, by choice. Offline tests cover reading identity, the row
   mapping, the daylight-saving edges and the conditional publish; correctness on GCP was confirmed
   by probing the deployed endpoint directly.
-* **Eight test rows** are permanent in `cgm.entries`, marked `device = 'xdrip2gcp-test'`.
+* **The spreadsheet rotates only when a reading arrives.** If the phone is off for a day, the sheet
+  keeps showing the window as it was at the last upload. A scheduled rewrite would fix it; nothing
+  in the sheet is ever wrong, only potentially stale.
+* **Overlapping uploads can clobber a sheet row**, since Sheets offers no transaction. Capping the
+  function at one instance would serialize it if this ever shows up in practice.
+* **Twelve test rows** are permanent in `cgm.entries`, marked `device = 'xdrip2gcp-test'`. Two
+  carry `sgv = 999` and a reading time well before their ingest time, from verifying that a late
+  reading cannot move the current value backwards (Stage 5) and that the 24-hour sheet cutoff
+  refuses an old one (Stage 6). The device filter excludes them like the rest.

@@ -382,6 +382,128 @@ def supersedes(candidate: Mapping[str, Any], stored: Mapping[str, Any] | None) -
 
 
 # --------------------------------------------------------------------------
+# The spreadsheet mirror of the recent day
+# --------------------------------------------------------------------------
+
+# Looker Studio issues one BigQuery query per chart, which adds up through the
+# day; its Sheets connector does not. So a rolling window of the recent day is
+# mirrored into a spreadsheet for the charts that get looked at most, while the
+# full history stays in BigQuery for the analysis.
+#
+# The window is small enough — a day of five-minute readings is under 300 rows —
+# that the sheet can serve as its own state. The function reads back what it
+# wrote last time, merges, and writes the block again, so it never needs to read
+# the history and its BigQuery role stays append-only.
+
+SHEET_HEADER = (
+    "reading_time_local",
+    "reading_date_local",
+    "clock_time",
+    "sgv",
+    "delta",
+    "direction",
+    "device",
+    "reading_epoch_ms",
+)
+
+# The row key, and the column the window is ordered and aged by. Last so that
+# the columns a human reads come first.
+SHEET_KEY_INDEX = SHEET_HEADER.index("reading_epoch_ms")
+
+
+def sheet_row(row: Mapping[str, Any]) -> list[Any]:
+    """One spreadsheet row, as cell values.
+
+    The local wall clock is split three ways on purpose. The full timestamp is
+    what a time series plots against; the date alone groups by day; and the
+    clock time alone is what lets one day be overlaid on another, which is the
+    chart a glucose dashboard actually wants and which is otherwise awkward to
+    derive in Looker.
+    """
+    local = row["reading_time_local"]
+    return [
+        local.isoformat(sep=" ", timespec="seconds"),
+        local.date().isoformat(),
+        local.strftime("%H:%M:%S"),
+        row["sgv"],
+        row["delta"],
+        row["direction"],
+        row["device"],
+        int(row[ORDER_COLUMN].timestamp() * 1000),
+    ]
+
+
+def _row_key(values: Sequence[Any]) -> int | None:
+    """The epoch-millisecond key of an existing sheet row, if it has one.
+
+    Rows read back from a spreadsheet are whatever is in the cells, which may be
+    short, empty, or hand-edited, so anything unparseable is treated as having
+    no key and is dropped rather than trusted.
+    """
+    if len(values) <= SHEET_KEY_INDEX:
+        return None
+    try:
+        return int(float(values[SHEET_KEY_INDEX]))
+    except (TypeError, ValueError):
+        return None
+
+
+def merge_sheet_window(
+    existing: Sequence[Sequence[Any]],
+    new_rows: Sequence[Mapping[str, Any]],
+    now: datetime,
+    window_hours: int = 24,
+) -> list[list[Any]]:
+    """The full block to write: the recent window, newest first.
+
+    Keyed by reading time, so a reading xDrip resends — or revises after a
+    calibration — replaces its own row instead of adding a second one. This is
+    the same idempotency as the `entries_current` view, done the only way a
+    spreadsheet allows.
+
+    The cutoff is measured from `now` rather than from the newest reading, so
+    that missed readings cannot let the window reach further back than it
+    claims to. A backlog flushed after days offline therefore adds little or
+    nothing here, which is correct: the sheet shows the recent day, and the
+    backlog is already in BigQuery.
+    """
+    cutoff = int((now - timedelta(hours=window_hours)).timestamp() * 1000)
+
+    window: dict[int, list[Any]] = {}
+    for values in existing:
+        key = _row_key(values)
+        if key is not None and key >= cutoff:
+            window[key] = list(values)
+
+    for row in new_rows:
+        values = sheet_row(row)
+        key = values[SHEET_KEY_INDEX]
+        if key >= cutoff:
+            window[key] = values
+
+    return [window[key] for key in sorted(window, reverse=True)]
+
+
+def sheet_range(tab: str, row_count: int, columns: int = len(SHEET_HEADER)) -> str:
+    """The A1 range covering the header plus `row_count` rows."""
+    last_column = chr(ord("A") + columns - 1)
+    return f"{tab}!A1:{last_column}{row_count + 1}"
+
+
+def stale_range(tab: str, written_rows: int, previous_rows: int) -> str | None:
+    """The range below the new block that still holds last time's rows.
+
+    Writing a block only overwrites what it covers, so a window that has shrunk
+    — readings aged out faster than new ones arrived — would leave the tail of
+    the previous write behind, looking like current data.
+    """
+    if previous_rows <= written_rows:
+        return None
+    last_column = chr(ord("A") + len(SHEET_HEADER) - 1)
+    return f"{tab}!A{written_rows + 2}:{last_column}{previous_rows + 1}"
+
+
+# --------------------------------------------------------------------------
 # Handler
 # --------------------------------------------------------------------------
 
@@ -394,6 +516,18 @@ RowAppender = Callable[[Sequence[Mapping[str, Any]]], None]
 # "failed". Never raises past the handler, because the document is derived from
 # a reading already stored and the next upload republishes it.
 CurrentPublisher = Callable[[Mapping[str, Any]], str]
+
+# Mirrors the recent window into the spreadsheet. Takes every row of the batch,
+# because unlike the current value, a reading that is not the newest still
+# belongs in the window.
+#
+# Returns what happened — "updated", "skipped" when no spreadsheet is
+# configured, or "failed" — together with how many rows the window ended up
+# holding. The count is reported because the sheet is the one destination that
+# cannot be read from an operator's machine: the Sheets API rejects the
+# cloud-platform token that `gcloud` mints, so the response is the only place
+# the window's size is visible.
+SheetMirror = Callable[[Sequence[Mapping[str, Any]]], tuple[str, int]]
 
 
 def _utcnow() -> datetime:
@@ -408,6 +542,7 @@ class Handler:
     appender: RowAppender
     timezone_name: str = "America/Denver"
     publisher: CurrentPublisher | None = None
+    mirror: SheetMirror | None = None
     entries_table: str = ""
     current_path: str = ""
     header_name: str = "api-secret"
@@ -528,6 +663,12 @@ class Handler:
         if self.publisher is not None and newest is not None:
             current = self.publisher(current_document(newest))
 
+        # Every row of the batch, not just the newest: a reading that lost the
+        # race to be "now" still belongs in the window.
+        sheet, sheet_rows = "skipped", 0
+        if self.mirror is not None:
+            sheet, sheet_rows = self.mirror(rows)
+
         return core.json_response(
             200,
             documents,
@@ -538,6 +679,8 @@ class Handler:
                 "x-xdrip2gcp-stored": "appended",
                 "x-xdrip2gcp-current": current,
                 "x-xdrip2gcp-current-path": self.current_path,
+                "x-xdrip2gcp-sheet": sheet,
+                "x-xdrip2gcp-sheet-rows": str(sheet_rows),
                 "x-xdrip2gcp-reading-id": str(newest[IDENTITY_COLUMN]) if newest else "",
             },
         )

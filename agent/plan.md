@@ -9,6 +9,7 @@ This plan will be broken into stages, some performed by the developer and some p
 3. Make a GCP function that can write to the bucket and use the `gcloud` cli to access it.
 4. Send data from xDrip through that GCP function and into the bucket from a phone.
 5. After the test pipeline works, form a production pipeline for BigQuery data.
+6. Mirror the recent day into Google Sheets, so dashboards can read it without querying BigQuery.
 
 ## Stage 1: GCP Project Setup and Local Dependencies (Developer) ✓ Done
 
@@ -951,15 +952,278 @@ Two things to know:
 * The `python314` runtime was the main risk here, since `google-cloud-bigquery-storage` pulls in
   `protobuf` and `grpcio`, and `google-cloud-firestore` pulls in more of the same. Cloud Build
   resolved them without trouble; no runtime downgrade was needed.
-* Eight rows in the permanent table are marked `device = 'xdrip2gcp-test'`. They can be excluded
-  with `WHERE device != 'xdrip2gcp-test'`, or deleted outright — though not for the first while
-  after they are written, since rows recently added through the Storage Write API resist DML until
-  the streaming buffer flushes.
+* Eight rows in the permanent table were marked `device = 'xdrip2gcp-test'` as of this stage, one of
+  them carrying `sgv = 999` — an impossible value, chosen so that a row written to test the
+  timestamp comparison could never be read as data. They can be excluded with
+  `WHERE device != 'xdrip2gcp-test'`, or deleted outright — though not for the first while after
+  they are written, since rows recently added through the Storage Write API resist DML until the
+  streaming buffer flushes. Exclude on the device and not on the value: the real sensor has reported
+  into the 460s. `agent/architecture.md` carries the current count.
 
 ### 5.9 Run a BigQuery query
 
 Use the BigQuery console in your GCP project, find your way to the `xdrip2gcp` resource, and under `cgm` you should see the created tables. You can now run a query such as
 
 ```
-SELECT * FROM `xdrip2gcp.cgm.entries` order by reading_date_utc desc LIMIT 1000
+SELECT * FROM `xdrip2gcp.cgm.entries_current`
+WHERE device != 'xdrip2gcp-test'
+ORDER BY reading_date_utc DESC LIMIT 1000
 ```
+
+Read through `entries_current` rather than `entries`, so that duplicates and superseded values are
+collapsed, and exclude the test device so that rows written during verification stay out of the
+answer.
+
+## Stage 6: Mirror the last 24 hours into Google Sheets (Agent) ✓ Done
+
+A third destination on the same upload, for one specific reason: **Looker Studio issues a separate
+BigQuery query per chart**, and a dashboard with a handful of charts refreshing through the day adds
+up against the free terabyte. Looker's Sheets connector does not pay that cost. So the heavy
+history stays in BigQuery for the analytical work, and a rolling 24-hour window is mirrored into a
+spreadsheet for the recent-day and recent-hour timecharts that get looked at most.
+
+Nothing about BigQuery or Firestore changes. This is purely additive: the same function, on the
+same upload, gains a third write.
+
+### 6.0 Decisions taken before building
+
+* **In the upload function, not a separate one.** A Firestore-triggered writer was the first
+  instinct, and it would have kept the upload path untouched — but see 6.1: once the window is
+  time-based it needs no history, so the isolation buys much less than it costs in moving parts.
+* **Strictly the last 24 hours, measured from wall-clock now**, not a fixed row count. A fixed 288
+  rows would silently reach further back than a day whenever readings were missed. The consequence
+  is that a multi-day backlog flush writes almost nothing to the sheet, which is correct: the sheet
+  is a view of the recent day, and the backlog is already in BigQuery.
+* **Rows are keyed by reading time.** A resent or revised reading updates its own row rather than
+  adding one. This is the same idempotency as the `entries_current` view and the conditional
+  Firestore write, achieved the only way a spreadsheet allows.
+* **Newest first.** The most recent reading is in row 2, under the header.
+* **Nothing is appended.** The window is written as a block, because `append` on an at-least-once
+  path accumulates duplicates that nothing would ever collapse.
+
+### 6.1 The sheet is its own state
+
+The idea that makes this cheap: **a 24-hour window is at most ~288 rows, which is small enough to
+read back from the sheet on every upload.** So the function does not need the history to rebuild the
+window — it reads the sheet it wrote last time, merges the new reading in, drops whatever has aged
+out, and writes the block back.
+
+That matters because the function is deliberately history-blind. Its BigQuery role was reduced to
+`tables.get` and `tables.updateData` when the current value moved to Firestore (5.5), and rebuilding
+a window from `entries_current` would have meant handing back `jobs.create` and read access. Keeping
+the window in the sheet avoids that entirely. The append-only identity stays append-only.
+
+Three Sheets calls per upload at most: read the current block, write the merged block, and clear any
+trailing rows when the window has shrunk. Against the API's 300 writes per minute per project, at
+one upload every five minutes, the quota is irrelevant.
+
+### 6.2 What the sheet holds
+
+One header row, then one row per reading, newest first:
+
+```
+reading_time_local | reading_date_local | clock_time | sgv | delta | direction | device | reading_epoch_ms
+```
+
+`reading_epoch_ms` is the row key, carried in the sheet because the merge needs it and because
+sorting on it is exact. `clock_time` is the time of day on its own, which is what makes overlaying
+one day on another — the chart a CGM dashboard actually wants — possible in Looker without
+expression gymnastics.
+
+Values are written with `valueInputOption=USER_ENTERED` so that Sheets parses the timestamp into a
+real datetime and the numbers into real numbers. With `RAW` everything arrives as text and Looker
+infers types from strings, which makes date handling unpleasant downstream.
+
+### 6.3 Rotation
+
+The cutoff is `now - 24h`, computed at write time from the same clock the ingest timestamp uses.
+Readings older than that are dropped from the block rather than deleted row by row.
+
+One honest consequence: **rotation only happens when a reading arrives.** If the phone is off for
+two days, the sheet still holds whatever it held when the last reading landed, until the next upload
+rewrites it. The dashboard can filter on `reading_time_local` if that matters; nothing in the sheet
+is ever wrong, it is only potentially stale.
+
+### 6.4 Three consequences accepted deliberately
+
+This is on the path a phone depends on every five minutes, so the costs are worth naming:
+
+* **Latency.** Two or three Sheets API calls are added to each upload, a few hundred milliseconds
+  to about a second. Against a 60-second timeout, harmless.
+* **No transactions.** Sheets has no equivalent of the Firestore transaction used for the current
+  value, so two overlapping uploads can both read and one can overwrite the other's row. That costs
+  a gap in the dashboard, never a reading, because BigQuery already has it — and it tends to heal
+  itself, since xDrip sends overlapping batches anyway (4.6). Capping the function at one instance
+  would serialize it, at the cost of queueing.
+* **Failure is reported, not raised.** Exactly as with the Firestore publish: the reading is already
+  in BigQuery by the time the sheet is touched, so a failure is logged, reported in the
+  `x-xdrip2gcp-sheet` response header, and otherwise ignored. The next upload rewrites the window.
+
+With no spreadsheet configured, the write is skipped and the header says so. The function therefore
+works unchanged before the sheet exists.
+
+### 6.5 The sheet is not a project resource, and access comes from sharing
+
+Worth stating plainly, because it is the first destination of which it is true. `cgm.entries` and
+`current/entries` are **resources inside the GCP project**: the setup scripts create them, the
+project owns them, and deleting the project deletes them. The spreadsheet is **a file in a person's
+Google Drive**, owned by their personal account. The project's involvement is exactly two things —
+`sheets.googleapis.com` enabled so the calls have somewhere to bill quota, and the service account
+identity the file is shared with. Nothing here can create, find, or delete it, and it outlives the
+project.
+
+That makes this the first piece of the system that cannot be fully provisioned by a script. The
+service account gets access the same way a colleague would: **the sheet is shared with its email
+address as an Editor.**
+
+No new IAM role is involved. The runtime identity asks the metadata server for a token scoped to
+`https://www.googleapis.com/auth/spreadsheets`; the Sheets API then authorizes per file, based on
+sharing. No service account key file, no Secret Manager entry, and no app verification, because
+there is no user consent flow.
+
+Two things about that token were worth establishing before writing any of it, because both would
+have changed the design:
+
+* **A `cloud-platform` token is not enough.** Verified against the live API: it returns 403
+  `ACCESS_TOKEN_SCOPE_INSUFFICIENT`. `cloud-platform` is a superset of the Google Cloud scopes, not
+  of the Workspace ones, so the scope has to be asked for explicitly.
+* **Cloud Run honours a requested scope; Compute Engine does not.** This is the difference between
+  this working and needing a whole impersonation apparatus, and it is stated in `google-auth`'s own
+  metadata credentials: *"On Compute Engine the metadata server ignores requested scopes. On Cloud
+  Run, Flex and App Engine the server honours requested scopes."* A gen2 function runs on Cloud Run,
+  so `google.auth.default(scopes=[...])` is sufficient.
+
+The same facts mean the **sheet cannot be read from a laptop** the way `show_latest.py` reads
+Firestore. `gcloud auth print-access-token` mints a `cloud-platform` token, and minting a
+spreadsheets-scoped one would mean granting the operator `roles/iam.serviceAccountTokenCreator` on
+the runtime identity — a standing privilege, for a convenience. Verification therefore happens
+through the function itself, which is better evidence anyway: it exercises the real identity on the
+real path, and reports the outcome in a response header.
+
+The spreadsheet ID is instance-specific, so it belongs in the git-ignored
+`resources/config.local.toml` alongside the bucket suffix and the password. The file's *name* is
+never used by anything — only the ID and the tab — so it can be renamed at any time without a
+redeploy.
+
+This is also the one place the repo's least-privilege pattern does not hold. Drive has no
+append-only role: the narrowest grant that can write a cell is Editor, which can equally clear the
+file. There is no way around it, so the containment is to keep the sheet **disposable** — a
+dedicated file holding nothing but the generated window, so that the worst case is a file that the
+next upload refills.
+
+### 6.6 Layout
+
+```
+src/functions/nightscout_bq/bq_core.py        gains: sheet rows, merge-by-time, cutoff, ranges
+src/functions/nightscout_bq/main.py           gains: the Sheets read-modify-write adapter
+src/functions/nightscout_bq/requirements.txt  gains: google-auth[requests]
+src/xdrip2gcp/config.py                        [sheets] -> SheetsConfig
+src/xdrip2gcp/cloudfunction.py                 the three XDRIP2GCP_SHEET_* variables
+src/deploy_bq_function.py                      prints the address the sheet must be shared with
+test/test_bq_core.py                           offline: rotation, in-place update, order, clearing
+```
+
+All of the logic lives in `bq_core.py` as pure functions over plain values, with the Sheets calls
+injected into the `Handler` as a callable beside `appender` and `publisher`. The parts that bite —
+the rotation boundary, a repeated timestamp updating rather than duplicating, ordering, and clearing
+trailing rows when the window shrinks — are therefore testable offline, with no spreadsheet.
+
+The three REST calls are made with `google.auth.transport.requests.AuthorizedSession` rather than
+the discovery-based `google-api-python-client`. Read a range, write a range, clear a range is not
+enough surface to justify the dependency; the only part worth not writing by hand is the token and
+its refresh, which is exactly what the session handles. So the only new requirement is
+`google-auth[requests]`, which the Google Cloud clients already pull in transitively — pinned
+explicitly because it is now depended on directly.
+
+### 6.8 Verify
+
+The function reports what happened on every upload, so the check is the response header rather than
+a query:
+
+```
+curl -s -o /dev/null -D - -X POST "$XDRIP2GCP_BQ_URL/api/v1/entries" \
+  -H "api-secret: $(printf %s "$XDRIP2GCP_PASSWORD" | shasum | cut -d' ' -f1)" \
+  -H 'content-type: application/json' --data '[...]' | grep x-xdrip2gcp
+```
+
+`x-xdrip2gcp-sheet` says `updated` when the window was rewritten, `skipped` when no spreadsheet is
+configured, and `failed` otherwise — in which case the function's log holds the API's own response
+body, which distinguishes the two failures that both arrive as a 403: the sheet not being shared
+with this identity, and the token lacking the spreadsheets scope.
+
+`x-xdrip2gcp-sheet-rows` reports how many rows the window ended up holding. It exists because the
+sheet is the one destination an operator cannot read from their own machine, so without it the
+window's size would only be observable by opening the spreadsheet.
+
+### 6.9 Verified results
+
+Setting it up took three tries, and each failure was distinguishable from the log alone, which is
+the thing worth recording:
+
+```
+x-xdrip2gcp-sheet: failed   403 PERMISSION_DENIED "The caller does not have permission"
+                            -> the file had not been shared with the service account
+x-xdrip2gcp-sheet: failed   400 INVALID_ARGUMENT "Unable to parse range: recent!A1:H2"
+                            -> the tab was still called Sheet1
+x-xdrip2gcp-sheet: updated
+```
+
+Note what the first failure proves in passing. A missing **scope** fails as 403
+`ACCESS_TOKEN_SCOPE_INSUFFICIENT`, which is what a `cloud-platform` token returns; this was 403
+`PERMISSION_DENIED`, the per-file kind. So the Cloud Run metadata server really did hand the
+function a spreadsheets-scoped token, confirming 6.5 on the live path rather than from a docstring.
+
+The merge was then exercised against the deployed function with a batch of three readings — one
+current, one an hour old, one deliberately 30 hours old:
+
+```
+--- first send ---          --- same batch again ---
+x-xdrip2gcp-sheet: updated  x-xdrip2gcp-sheet: updated
+x-xdrip2gcp-sheet-rows: 4   x-xdrip2gcp-sheet-rows: 4
+```
+
+Three things fall out of that. The window did not grow on the resend, so merging by reading time
+does collapse a repeat rather than duplicating it. The 30-hour-old reading is in `cgm.entries` but
+never entered the window, so the cutoff holds on real data. And the count is four rather than three
+because real readings from the phone were arriving every five minutes throughout.
+
+One wrinkle met while checking the last point, worth knowing before it wastes someone's afternoon:
+the raw table holds **two** identical rows for the resent reading, with one `reading_id` and two
+`ingest_time`s. That is the Storage Write API's at-least-once delivery behaving exactly as designed,
+and `entries_current` collapses them. Count through the view, never the table.
+
+149 tests pass: 139 offline, including the sheet window and the headers, and 10 skipped or live.
+
+One flaw in the first implementation was found by this process rather than by the tests. The read of
+the existing window treated **any** 400 as "the tab is empty", on the guess that a range beyond a
+sheet's extent would be rejected. It is not — an empty tab answers 200 with no `values` key — so the
+only thing that handling could do was swallow a misnamed tab and report the window as empty. It was
+removed. Speculative error handling hid a real misconfiguration, and the write would have surfaced
+it a moment later anyway.
+
+### 6.7 Manual setup
+
+Three steps, unavoidable given where a spreadsheet lives:
+
+1. Create a spreadsheet. Note its ID from the URL, the part between `/d/` and `/edit`.
+2. Share it as **Editor** with the runtime identity's email address.
+3. Put the ID in `resources/config.local.toml` under `[sheets] spreadsheet_id`.
+
+`sheets.googleapis.com` is added to `[gcp] services`, so the existing setup script enables it, and
+`deploy_bq_function.py` prints the address to share with.
+
+Two constraints come from the Looker Studio end rather than from this repo, and both are reasons to
+create the file in a particular way:
+
+* **Keep it in My Drive, not a shared drive.** Looker Studio's own troubleshooting notes still say
+  it cannot reach files on a Team Drive and that sheets must live in standard Drive folders.
+* **The Sheets connector's fastest refresh is every 15 minutes**, where BigQuery's goes down to one.
+  So the sheet-backed charts can sit up to fifteen minutes behind a reading that arrived five
+  minutes ago — fine for the shape of a day, and the report's manual refresh bypasses the cache when
+  the exact latest number matters. The genuinely live value is the Firestore document, which is what
+  it is for.
+
+Looker also authorizes as the Google account signed in to Looker Studio, not as the function's
+identity, so the two access paths are independent: the service account is an Editor so it can write,
+and you reach the same file as its owner. Setting the data source to **Owner's Credentials** means
+anyone you later show the dashboard to does not need access to the sheet at all.

@@ -93,6 +93,25 @@ class BigQueryConfig:
 
 
 @dataclass(frozen=True)
+class SheetsConfig:
+    """The rolling spreadsheet mirror of the recent day."""
+
+    spreadsheet_id: str
+    tab: str
+    window_hours: int
+
+    @property
+    def enabled(self) -> bool:
+        """Whether a spreadsheet has been configured at all.
+
+        Absent is a legitimate state, not an error: the sheet lives in someone's
+        Drive and has to be created and shared by hand, so the function has to
+        run correctly before it exists.
+        """
+        return bool(self.spreadsheet_id)
+
+
+@dataclass(frozen=True)
 class FirestoreConfig:
     """Where the single current reading is published."""
 
@@ -146,6 +165,7 @@ class Config:
     auth: AuthConfig | None = None
     bigquery: BigQueryConfig | None = None
     firestore: FirestoreConfig | None = None
+    sheets: SheetsConfig | None = None
 
     @property
     def bucket_uri(self) -> str:
@@ -407,6 +427,7 @@ def load_config(
     auth = raw.get("auth", {})
     bigquery = raw.get("bigquery", {})
     firestore = raw.get("firestore", {})
+    sheets = raw.get("sheets", {})
 
     project_id = str(project.get("id", "")).strip()
     if not project_id:
@@ -436,6 +457,10 @@ def load_config(
     lifecycle_age_days = int(bucket.get("lifecycle_age_days", 0))
     if lifecycle_age_days < 0:
         raise ConfigError("[bucket].lifecycle_age_days may not be negative")
+
+    window_hours = int(sheets.get("window_hours", 24))
+    if window_hours < 1:
+        raise ConfigError("[sheets].window_hours must be at least 1")
 
     timezone_name = str(bigquery.get("timezone", "America/Denver")).strip()
     if not timezone_name:
@@ -504,6 +529,11 @@ def load_config(
             location=str(firestore.get("location", "")).strip(),
             collection=str(firestore.get("collection", "current")).strip("/"),
             document=str(firestore.get("document", "entries")).strip("/"),
+        ),
+        sheets=SheetsConfig(
+            spreadsheet_id=str(sheets.get("spreadsheet_id", "")).strip(),
+            tab=str(sheets.get("tab", "recent")).strip(),
+            window_hours=window_hours,
         ),
         auth=AuthConfig(
             header_name=str(auth.get("header_name", "api-secret")),
