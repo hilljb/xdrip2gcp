@@ -257,5 +257,137 @@ class CurrentValueTests(unittest.TestCase):
         self.assertTrue(bq.supersedes(self.document(ENTRY), {bq.CURRENT_EPOCH_FIELD: "corrupt"}))
 
 
+class SheetWindowTests(unittest.TestCase):
+    """The rolling 24-hour window mirrored into the spreadsheet.
+
+    The sheet is the window's only storage, so this merge is the whole design:
+    get it wrong and the dashboard either grows duplicates forever or quietly
+    reaches further back than the day it claims to show.
+    """
+
+    # Noon the day after the anchor reading, so the fixture sits comfortably
+    # inside the window and the boundary cases are deliberate.
+    NOW = datetime(2026, 9, 5, 12, 0, 0, tzinfo=timezone.utc)
+
+    def reading(self, minutes_before_now: int, **overrides):
+        taken = self.NOW - timedelta(minutes=minutes_before_now)
+        return row(dict(ENTRY, date=int(taken.timestamp() * 1000), **overrides))
+
+    def merge(self, existing, readings):
+        return bq.merge_sheet_window(existing, readings, self.NOW)
+
+    def keys(self, window):
+        return [values[bq.SHEET_KEY_INDEX] for values in window]
+
+    def test_a_row_carries_the_local_clock_three_ways(self) -> None:
+        # The full timestamp plots a time series, the date groups by day, and
+        # the clock time alone is what overlays one day on another.
+        values = bq.sheet_row(row())
+        self.assertEqual(len(values), len(bq.SHEET_HEADER))
+        self.assertEqual(values[0], "2026-09-04 17:33:34")
+        self.assertEqual(values[1], "2026-09-04")
+        self.assertEqual(values[2], "17:33:34")
+        self.assertEqual(values[bq.SHEET_KEY_INDEX], ENTRY["date"])
+
+    def test_the_newest_reading_is_the_first_row(self) -> None:
+        window = self.merge([], [self.reading(60), self.reading(5), self.reading(30)])
+        self.assertEqual(self.keys(window), sorted(self.keys(window), reverse=True))
+        self.assertEqual(window[0][3], ENTRY["sgv"])
+
+    def test_a_repeated_reading_updates_its_row_instead_of_adding_one(self) -> None:
+        # xDrip resends, and revises a value after a calibration. Both must
+        # land on the row that instant already has.
+        first = self.merge([], [self.reading(10)])
+        again = self.merge(first, [self.reading(10, sgv=140, direction="SingleUp")])
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0][3], 140)
+        self.assertEqual(again[0][5], "SingleUp")
+
+    def test_readings_older_than_the_window_are_dropped(self) -> None:
+        inside = self.reading(60 * 23)
+        outside = self.reading(60 * 25)
+        window = self.merge([bq.sheet_row(outside)], [inside])
+        self.assertEqual(self.keys(window), [bq.sheet_row(inside)[bq.SHEET_KEY_INDEX]])
+
+    def test_the_cutoff_follows_the_clock_not_the_newest_reading(self) -> None:
+        # A backlog flushed after days offline must not drag the window back
+        # with it: the sheet shows the recent day, and BigQuery has the rest.
+        window = self.merge([], [self.reading(60 * 50), self.reading(60 * 49)])
+        self.assertEqual(window, [])
+
+    def test_the_boundary_is_inclusive_to_the_millisecond(self) -> None:
+        cutoff_ms = int((self.NOW - timedelta(hours=24)).timestamp() * 1000)
+        on_the_boundary = row(dict(ENTRY, date=cutoff_ms))
+        just_outside = row(dict(ENTRY, date=cutoff_ms - 1))
+        self.assertEqual(len(self.merge([], [on_the_boundary])), 1)
+        self.assertEqual(self.merge([], [just_outside]), [])
+
+    def test_unparseable_existing_rows_are_dropped_rather_than_trusted(self) -> None:
+        # Rows come back from a spreadsheet as whatever is in the cells, which
+        # someone may have edited by hand.
+        existing = [["", "", ""], ["2026-09-05 11:00:00", "x", "y", 100, 0, "Flat", "d", "oops"]]
+        window = self.merge(existing, [self.reading(5)])
+        self.assertEqual(len(window), 1)
+
+    def test_existing_rows_survive_a_merge_that_adds_nothing_to_them(self) -> None:
+        existing = self.merge([], [self.reading(20), self.reading(15)])
+        window = self.merge(existing, [self.reading(5)])
+        self.assertEqual(len(window), 3)
+
+    def test_the_written_range_covers_the_header_and_every_row(self) -> None:
+        self.assertEqual(bq.sheet_range("recent", 3), "recent!A1:H4")
+        # An empty window still rewrites the header, so the tab never looks
+        # like it was never set up.
+        self.assertEqual(bq.sheet_range("recent", 0), "recent!A1:H1")
+
+    def test_a_shrinking_window_clears_what_it_no_longer_covers(self) -> None:
+        # Writing a block only overwrites what it covers, so without this the
+        # tail of the previous write stays behind looking like live data.
+        self.assertEqual(bq.stale_range("recent", 2, 5), "recent!A4:H6")
+        self.assertIsNone(bq.stale_range("recent", 5, 5))
+        self.assertIsNone(bq.stale_range("recent", 7, 5))
+
+
+class MirrorReportingTests(unittest.TestCase):
+    """What the handler says about the spreadsheet, and what it refuses to do.
+
+    The sheet cannot be read from an operator's machine, so these headers are
+    the only visibility into it. They are also the guard on the rule that
+    matters most here: a derived destination must never cost a reading.
+    """
+
+    def handle(self, mirror):
+        stored: list = []
+        handler = bq.Handler(
+            secret_payload={"salt": "", "digest": ""},
+            appender=stored.extend,
+            mirror=mirror,
+            entries_table="p.cgm.entries",
+        )
+        request = bq.core.Request(
+            method="POST", path="/api/v1/entries", body=json.dumps([ENTRY]).encode()
+        )
+        return handler._store(request), stored
+
+    def test_the_window_size_is_reported(self) -> None:
+        response, _ = self.handle(lambda rows: ("updated", 7))
+        self.assertEqual(response.headers["x-xdrip2gcp-sheet"], "updated")
+        self.assertEqual(response.headers["x-xdrip2gcp-sheet-rows"], "7")
+
+    def test_no_mirror_configured_is_reported_as_skipped(self) -> None:
+        response, _ = self.handle(None)
+        self.assertEqual(response.headers["x-xdrip2gcp-sheet"], "skipped")
+        self.assertEqual(response.headers["x-xdrip2gcp-sheet-rows"], "0")
+
+    def test_a_failed_mirror_still_stores_the_reading_and_answers_200(self) -> None:
+        # The spreadsheet is derived from a row that is already in BigQuery.
+        # Failing the request would make the phone retry a reading it has
+        # already delivered, to fix something a retry cannot fix.
+        response, stored = self.handle(lambda rows: ("failed", 0))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["x-xdrip2gcp-sheet"], "failed")
+        self.assertEqual(len(stored), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

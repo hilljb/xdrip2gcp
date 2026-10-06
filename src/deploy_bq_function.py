@@ -30,6 +30,19 @@ from xdrip2gcp.config import ConfigError, ensure_password, load_config  # noqa: 
 from xdrip2gcp.function_source import shared_module_paths  # noqa: E402
 
 
+def _sheet_target(config) -> str:
+    """What the spreadsheet mirror will do on this deploy, in one line.
+
+    A spreadsheet lives in a person's Drive, so it cannot be provisioned from
+    here: the only thing the deploy can usefully do is name the address the
+    sheet has to be shared with.
+    """
+    sheets = config.sheets
+    if not sheets.enabled:
+        return "not configured; set [sheets].spreadsheet_id in resources/config.local.toml"
+    return f"{sheets.tab} tab, last {sheets.window_hours}h, in {sheets.spreadsheet_id}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="show the plan, change nothing")
@@ -58,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"identity  {config.bq_runtime_service_account}")
     print(f"dataset   {config.entries_table_id}")
     print(f"current   {config.firestore.path}")
+    print(f"sheet     {_sheet_target(config)}")
     print(f"shared    {', '.join(path.name for path in shared)}")
 
     if not bigquery.dataset_exists(config):
@@ -98,6 +112,14 @@ def main(argv: list[str] | None = None) -> int:
         shared_modules=shared,
     )
     print(f"  [{result.marker}] {result}")
+
+    if config.sheets.enabled:
+        print(
+            "\nthe spreadsheet must be shared as Editor with:"
+            f"\n  {config.bq_runtime_service_account}"
+            "\nSheets authorizes per file through Drive sharing, not through IAM,"
+            "\nso no grant from this project can substitute for it."
+        )
 
     url = cloudfunction.function_url(config, function=function)
     if url:

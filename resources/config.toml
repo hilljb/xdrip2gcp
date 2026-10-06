@@ -81,6 +81,9 @@ services = [
     # The current reading's home. Firestore's IAM permissions are named
     # datastore.* for historical reasons, but only this API needs enabling.
     "firestore.googleapis.com",
+    # Stage 6. Enabling the API is all the project can do for the spreadsheet;
+    # access to the document itself comes from Drive sharing, not from IAM.
+    "sheets.googleapis.com",
 ]
 
 [service_accounts]
@@ -156,6 +159,27 @@ collection = "current"
 # One document, overwritten in place. `entries` matches the collection name the
 # readings arrive under.
 document = "entries"
+
+[sheets]
+# Stage 6. A rolling mirror of the last 24 hours, for dashboards.
+#
+# Looker Studio issues one BigQuery query per chart, which adds up through the
+# day; its Sheets connector does not. So the full history stays in BigQuery for
+# analysis and the recent day is mirrored here for the charts that get looked at
+# most.
+#
+# A spreadsheet lives in a person's Drive rather than in the project, so this is
+# the one destination that cannot be provisioned by a script. Create the sheet,
+# share it as Editor with the runtime identity (deploy_bq_function.py prints the
+# address), and put its ID in resources/config.local.toml. Leave the ID empty
+# and the function skips the write entirely.
+spreadsheet_id = ""
+# The tab written to. It is overwritten in place on every upload, so keep
+# anything hand-entered on a different tab.
+tab = "recent"
+# How far back the mirror reaches, measured from now rather than from the newest
+# reading, so missed readings cannot make the window reach further than a day.
+window_hours = 24
 
 [function_bq]
 # Deployed alongside the Stage 3 function, sharing its Nightscout password, so

@@ -6,7 +6,7 @@ queried as history and read as a live value.
 [xDrip](https://navid200.github.io/xDrip/) already knows how to upload to
 [Nightscout](https://nightscout.github.io/), so this repo puts something on the other end of that
 upload: a Cloud Function that speaks enough of the Nightscout REST API for xDrip to be satisfied,
-and writes each reading to two places at once.
+and writes each reading to three places at once.
 
 ```
    Dexcom sensor
@@ -14,23 +14,33 @@ and writes each reading to two places at once.
    xDrip on Android  ──── Nightscout REST, every 5 minutes ────┐
                                                               v
                                             Cloud Function (Python, 2nd gen)
-                                                     |               |
-                                    append-only      |               |   one document,
-                                    history          v               v   overwritten
-                                              BigQuery            Firestore
-                                            cgm.entries        current/entries
-                                                  |                    |
-                                        Looker Studio          smart displays,
-                                          dashboards          web pages, widgets
+                              |                      |                      |
+         append-only          |      one document,   |      rolling         |
+         history              v      overwritten     v      24 hours        v
+                        BigQuery                Firestore              Google Sheets
+                       cgm.entries           current/entries            recent tab
+                            |                        |                       |
+                   Looker Studio             smart displays,          Looker Studio
+                   deep analysis            pages, widgets          recent-day charts
 ```
 
-Two destinations because the two questions are different. **BigQuery** holds every reading forever,
-partitioned by day in both UTC and local time, which is what makes in-depth
-[Looker Studio](https://cloud.google.com/looker-studio) dashboards cheap to build — overnight
-patterns, time in range, day-over-day comparisons. **Firestore** holds a single document with the
-newest reading, because asking a data warehouse "what is my blood sugar right now" costs a 10 MiB
-minimum per query no matter how little you want back. One document read answers it instead, which
-suits a smart home display, a web page, or a phone widget.
+Three destinations because the three questions are different.
+
+**BigQuery** holds every reading forever, partitioned by day in both UTC and local time, which is
+what makes in-depth [Looker Studio](https://cloud.google.com/looker-studio) analysis possible —
+overnight patterns, time in range, day-over-day comparisons.
+
+**Firestore** holds a single document with the newest reading, because asking a data warehouse "what
+is my blood sugar right now" costs a 10 MiB minimum per query no matter how little you want back.
+One document read answers it instead, which suits a smart home display, a web page, or a phone
+widget.
+
+**Google Sheets** holds a rolling mirror of the last 24 hours. Looker Studio issues a separate
+BigQuery query for every chart on a dashboard, which adds up through a day of refreshes; its Sheets
+connector does not. So the charts that get looked at most — the recent day, the last hour — read a
+few hundred rows from a spreadsheet instead. Unlike the other two, this one is not a resource in the
+cloud project: it is an ordinary file in your own Google Drive that the project is given permission
+to write to.
 
 ## What it costs
 
@@ -45,6 +55,7 @@ inside its permanent free allowance:
 | Firestore reads | 1 per check | 50,000/day |
 | Cloud Run invocations | ~8,600/month | 2,000,000/month |
 | Secret Manager | 1 secret version | 6 versions |
+| Sheets API writes | ~576/day | 300/minute |
 
 A billing account still has to be linked, because some of these APIs refuse to run without one.
 The only meter that grows with activity rather than with data is Artifact Registry, which keeps the

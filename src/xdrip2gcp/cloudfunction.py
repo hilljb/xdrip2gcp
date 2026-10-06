@@ -44,6 +44,7 @@ def bq_function_env(config: Config) -> dict[str, str]:
     """Environment the BigQuery-backed function reads at runtime."""
     bigquery = config.bigquery
     firestore = config.firestore
+    sheets = config.sheets
     return {
         "XDRIP2GCP_BQ_PROJECT": config.project_id,
         "XDRIP2GCP_BQ_DATASET": bigquery.dataset,
@@ -54,6 +55,19 @@ def bq_function_env(config: Config) -> dict[str, str]:
         "XDRIP2GCP_FS_DOCUMENT": firestore.document,
         "XDRIP2GCP_AUTH_HEADER": config.auth.header_name,
         "XDRIP2GCP_MAX_REQUEST_BYTES": str(config.auth.max_request_bytes),
+        # Only when a spreadsheet has been configured. The deploy replaces the
+        # whole environment rather than updating it, so leaving these out is
+        # what turns the mirror back off, and it avoids handing gcloud an empty
+        # value in a comma-separated list.
+        **(
+            {
+                "XDRIP2GCP_SHEET_ID": sheets.spreadsheet_id,
+                "XDRIP2GCP_SHEET_TAB": sheets.tab,
+                "XDRIP2GCP_SHEET_HOURS": str(sheets.window_hours),
+            }
+            if sheets.enabled
+            else {}
+        ),
     }
 
 

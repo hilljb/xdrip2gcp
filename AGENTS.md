@@ -14,8 +14,8 @@ The four rules most easily broken by accident:
 * **Everything that touches GCP must be idempotent** and return an `ActionResult`. A second run of
   any script has to report nothing but no-ops.
 * **Never commit anything instance-specific**: not the generated bucket suffix, not a function
-  hostname, and above all not the Nightscout password, which lives only in the git-ignored
-  `resources/config.local.toml`.
+  hostname, not a spreadsheet ID, and above all not the Nightscout password, all of which live only
+  in the git-ignored `resources/config.local.toml`.
 
 Verify a change with the tests and by converging the setup scripts:
 

@@ -15,6 +15,9 @@ The two writers are deliberately different in how they fail:
 * Publishing the current reading to Firestore is derived state: the reading is
   already stored by the time it runs, so a failure is reported in a response
   header and nothing more, and the next upload republishes it.
+* Mirroring the recent day into a spreadsheet is derived state too, and fails
+  the same way. The sheet holds its own window, so this reads it back, merges,
+  and writes it again rather than querying BigQuery for history.
 
 The protobuf descriptor the Storage Write API needs is built at runtime from
 `bq_core.SCHEMA`, the same definition that generates the table DDL, so the
@@ -27,9 +30,12 @@ from __future__ import annotations
 
 import os
 import traceback
-from datetime import date
+import urllib.parse
+from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
+import google.auth
+import google.auth.transport.requests
 from google.cloud import bigquery_storage_v1, firestore
 from google.cloud.bigquery_storage_v1 import types, writer
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
@@ -44,6 +50,9 @@ TIMEZONE_ENV = "XDRIP2GCP_BQ_TIMEZONE"
 DATABASE_ENV = "XDRIP2GCP_FS_DATABASE"
 COLLECTION_ENV = "XDRIP2GCP_FS_COLLECTION"
 DOCUMENT_ENV = "XDRIP2GCP_FS_DOCUMENT"
+SHEET_ID_ENV = "XDRIP2GCP_SHEET_ID"
+SHEET_TAB_ENV = "XDRIP2GCP_SHEET_TAB"
+SHEET_HOURS_ENV = "XDRIP2GCP_SHEET_HOURS"
 SECRET_ENV = "NIGHTSCOUT_SECRET"
 HEADER_ENV = "XDRIP2GCP_AUTH_HEADER"
 MAX_BYTES_ENV = "XDRIP2GCP_MAX_REQUEST_BYTES"
@@ -69,7 +78,15 @@ PROTO_TYPES = {
 _handler: bq_core.Handler | None = None
 _write_client: bigquery_storage_v1.BigQueryWriteClient | None = None
 _firestore_client: firestore.Client | None = None
+_sheets_session: Any = None
 _message_class: Any = None
+
+SHEETS_API = "https://sheets.googleapis.com/v4/spreadsheets"
+# The Sheets API authorizes per file, through Drive sharing rather than IAM, and
+# will not accept a cloud-platform token. The runtime identity can mint one with
+# this scope from the metadata server, so no key file is needed.
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+SHEETS_TIMEOUT_SECONDS = 20
 
 
 class ConfigurationError(Exception):
@@ -228,6 +245,94 @@ def _replace_if_newer(transaction, reference, document: Mapping[str, Any]) -> bo
     return True
 
 
+def _sheets() -> Any:
+    """An authorized session for the Sheets REST API.
+
+    Three endpoints are needed — read a range, write a range, clear a range —
+    which is not enough to justify the discovery-based client library and the
+    dependencies it brings. `AuthorizedSession` handles the token and its
+    refresh, which is the only part worth not writing by hand.
+    """
+    global _sheets_session
+    if _sheets_session is None:
+        credentials, _ = google.auth.default(scopes=[SHEETS_SCOPE])
+        _sheets_session = google.auth.transport.requests.AuthorizedSession(credentials)
+    return _sheets_session
+
+
+def _sheet_values(session: Any, spreadsheet: str, range_: str) -> list[list[Any]]:
+    """Read a range, returning [] when the tab holds nothing yet.
+
+    An empty tab answers 200 with no `values` key, so a 400 is not emptiness —
+    it means the range named a tab that is not there, which must surface rather
+    than be read as "the window is empty".
+    """
+    response = session.get(
+        f"{SHEETS_API}/{spreadsheet}/values/{urllib.parse.quote(range_)}",
+        params={"valueRenderOption": "UNFORMATTED_VALUE"},
+        timeout=SHEETS_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.json().get("values") or []
+
+
+def _mirror_recent(rows: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
+    """Rewrite the spreadsheet's rolling window to include these readings.
+
+    Read, merge, write — the sheet is the window's only storage, so this needs
+    no access to the history and the BigQuery identity stays append-only.
+
+    Reports failure rather than raising: every reading here is already in
+    BigQuery, and the next upload rewrites the whole window anyway, so there is
+    nothing a failure can lose that is not recovered five minutes later.
+    """
+    spreadsheet = os.environ.get(SHEET_ID_ENV, "").strip()
+    if not spreadsheet or not rows:
+        return "skipped", 0
+
+    tab = os.environ.get(SHEET_TAB_ENV, "recent").strip() or "recent"
+    hours = int(os.environ.get(SHEET_HOURS_ENV, "24"))
+
+    try:
+        session = _sheets()
+        # A1:H is the whole tab below the header, however long it has become.
+        existing = _sheet_values(session, spreadsheet, f"{tab}!A2:H")
+        window = bq_core.merge_sheet_window(
+            existing, rows, datetime.now(timezone.utc), hours
+        )
+
+        body = {"values": [list(bq_core.SHEET_HEADER), *window]}
+        written = session.put(
+            f"{SHEETS_API}/{spreadsheet}/values"
+            f"/{urllib.parse.quote(bq_core.sheet_range(tab, len(window)))}",
+            params={"valueInputOption": "USER_ENTERED"},
+            json=body,
+            timeout=SHEETS_TIMEOUT_SECONDS,
+        )
+        written.raise_for_status()
+
+        # Writing a block only overwrites what it covers, so a window that has
+        # shrunk leaves the tail of the previous write looking like live data.
+        stale = bq_core.stale_range(tab, len(window), len(existing))
+        if stale is not None:
+            cleared = session.post(
+                f"{SHEETS_API}/{spreadsheet}/values/{urllib.parse.quote(stale)}:clear",
+                json={},
+                timeout=SHEETS_TIMEOUT_SECONDS,
+            )
+            cleared.raise_for_status()
+
+        return "updated", len(window)
+    except Exception as error:  # noqa: BLE001 - derived state; log and carry on
+        # The body, not just the status: Sheets puts the useful part there, and
+        # the two failures worth telling apart both look like 403 — the sheet
+        # not being shared with this identity, and the token lacking the
+        # spreadsheets scope.
+        detail = getattr(getattr(error, "response", None), "text", "")
+        print(f"mirroring the recent window to Sheets failed: {detail}\n{traceback.format_exc()}")
+        return "failed", 0
+
+
 def _publish_current(document: Mapping[str, Any]) -> str:
     """Publish the reading as the current value.
 
@@ -256,6 +361,7 @@ def _build_handler() -> bq_core.Handler:
         secret_payload=payload,
         appender=_append_rows,
         publisher=_publish_current,
+        mirror=_mirror_recent,
         timezone_name=_require_env(TIMEZONE_ENV),
         entries_table=_table_id(ENTRIES_ENV),
         current_path=_document_path(),
