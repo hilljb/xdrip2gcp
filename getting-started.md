@@ -244,10 +244,11 @@ calls have somewhere to bill quota, and that the function's service account — 
 identity — is handed access to your file the same way a colleague would be. So this is the one part
 that cannot be scripted, and the only part where you grant access in Drive rather than in IAM.
 
-1. Create a blank spreadsheet **in My Drive**, not a shared drive, and rename a tab to `recent`.
-   Looker Studio cannot reach files on a shared drive. Name the file whatever you like — nothing in
-   this repo reads the name — but pick something that warns you off editing it by hand, because the
-   function overwrites the whole tab every five minutes.
+1. Create a blank spreadsheet **in My Drive**, not a shared drive, with two tabs named `recent` and
+   `current`. Looker Studio cannot reach files on a shared drive, and both tabs must exist before
+   you deploy — the function writes to them but will not create them. Name the file whatever you
+   like — nothing in this repo reads the name — but pick something that warns you off editing it by
+   hand, because the function overwrites both tabs every five minutes.
 2. Copy its ID out of the URL. You do not choose the ID; Google assigns it when the file is created.
    It is the long string between `/d/` and `/edit`:
    `docs.google.com/spreadsheets/d/`**`1a2B3c...xYz`**`/edit`.
@@ -269,7 +270,12 @@ Within five minutes the `recent` tab fills with the last 24 hours, newest first,
 `reading_time_local`, `reading_date_local`, `clock_time`, `sgv`, `delta`, `direction`, `device` and
 `reading_epoch_ms`. The whole block is rewritten on every upload: rows age out past 24 hours, and a
 reading xDrip resends or revises updates its own row rather than adding a second one. Anything you
-want to keep by hand belongs on a different tab.
+want to keep by hand belongs in a different file.
+
+The `current` tab gets the same columns but only ever one row: the newest reading. It exists because
+Looker Studio applies row limits *after* aggregation, which makes "chart only the latest reading"
+awkward to express — a tab with one row in it needs no sort, filter or limit at all. Set
+`[sheets] current_tab = ""` if you would rather not have it.
 
 Two things to expect. The window only rotates when a reading arrives, so with the phone off the
 sheet keeps showing the window as it last stood. And if the mirror fails, the reading is still
@@ -284,11 +290,13 @@ stop it.
 
 ### Connecting Looker Studio to it
 
-Create a data source, pick the **Google Sheets** connector, choose the file and the `recent`
-worksheet, and leave *Use first row as headers* on. Two settings are worth getting right: set data
-freshness to **Every 15 minutes**, which is the fastest the Sheets connector offers, and set data
-credentials to **Owner's Credentials** so that showing someone the dashboard does not require
-sharing the spreadsheet with them.
+Create a data source, pick the **Google Sheets** connector, choose the file and a worksheet, and
+leave *Use first row as headers* on. Each tab is a separate data source: point time-series and
+day-overlay charts at `recent`, and anything that should show just the latest number — a scorecard,
+a single-value gauge — at `current`. Two settings are worth getting right: set data freshness to
+**Every 15 minutes**, which is the fastest the Sheets connector offers, and set data credentials to
+**Owner's Credentials** so that showing someone the dashboard does not require sharing the
+spreadsheet with them.
 
 Fifteen minutes is the one real cost of reading through Sheets instead of BigQuery, whose freshness
 goes down to a minute. It does not affect the shape of the day, a report's manual refresh bypasses

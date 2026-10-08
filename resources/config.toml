@@ -177,6 +177,12 @@ spreadsheet_id = ""
 # The tab written to. It is overwritten in place on every upload, so keep
 # anything hand-entered on a different tab.
 tab = "recent"
+# A second tab holding the header and exactly one row: the newest reading.
+# Looker Studio applies row limits after aggregation, so "chart only the latest
+# reading" is awkward to express; a tab with one row in it needs no filter at
+# all. Both tabs must already exist in the spreadsheet. Leave this empty to
+# write only the window.
+current_tab = "current"
 # How far back the mirror reaches, measured from now rather than from the newest
 # reading, so missed readings cannot make the window reach further than a day.
 window_hours = 24

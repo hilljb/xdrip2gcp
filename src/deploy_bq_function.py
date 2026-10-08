@@ -40,7 +40,10 @@ def _sheet_target(config) -> str:
     sheets = config.sheets
     if not sheets.enabled:
         return "not configured; set [sheets].spreadsheet_id in resources/config.local.toml"
-    return f"{sheets.tab} tab, last {sheets.window_hours}h, in {sheets.spreadsheet_id}"
+    tabs = f"{sheets.tab} (last {sheets.window_hours}h)"
+    if sheets.current_tab:
+        tabs += f" + {sheets.current_tab} (newest row)"
+    return f"{tabs}, in {sheets.spreadsheet_id}"
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -55,19 +55,21 @@ def bq_function_env(config: Config) -> dict[str, str]:
         "XDRIP2GCP_FS_DOCUMENT": firestore.document,
         "XDRIP2GCP_AUTH_HEADER": config.auth.header_name,
         "XDRIP2GCP_MAX_REQUEST_BYTES": str(config.auth.max_request_bytes),
-        # Only when a spreadsheet has been configured. The deploy replaces the
-        # whole environment rather than updating it, so leaving these out is
-        # what turns the mirror back off, and it avoids handing gcloud an empty
-        # value in a comma-separated list.
-        **(
-            {
-                "XDRIP2GCP_SHEET_ID": sheets.spreadsheet_id,
-                "XDRIP2GCP_SHEET_TAB": sheets.tab,
-                "XDRIP2GCP_SHEET_HOURS": str(sheets.window_hours),
-            }
-            if sheets.enabled
-            else {}
-        ),
+        # Only when a spreadsheet has been configured, and only the settings
+        # that have a value. The deploy replaces the whole environment rather
+        # than updating it, so leaving a variable out is what turns the
+        # corresponding write back off — and an empty value would anyway be
+        # ambiguous in the comma-separated list gcloud is handed.
+        **{
+            name: value
+            for name, value in (
+                ("XDRIP2GCP_SHEET_ID", sheets.spreadsheet_id),
+                ("XDRIP2GCP_SHEET_TAB", sheets.tab),
+                ("XDRIP2GCP_SHEET_CURRENT_TAB", sheets.current_tab),
+                ("XDRIP2GCP_SHEET_HOURS", str(sheets.window_hours)),
+            )
+            if sheets.enabled and value
+        },
     }
 
 

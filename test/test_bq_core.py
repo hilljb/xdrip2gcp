@@ -334,6 +334,28 @@ class SheetWindowTests(unittest.TestCase):
         window = self.merge(existing, [self.reading(5)])
         self.assertEqual(len(window), 3)
 
+    def test_the_one_row_tab_holds_the_header_and_the_newest_reading(self) -> None:
+        window = self.merge([], [self.reading(60), self.reading(5), self.reading(30)])
+        block = bq.current_block(window)
+        self.assertEqual(len(block), 2)
+        self.assertEqual(block[0], list(bq.SHEET_HEADER))
+        self.assertEqual(block[1], window[0])
+        # Two rows exactly, so nothing below it ever needs clearing.
+        self.assertEqual(bq.sheet_range("current", 1), "current!A1:H2")
+
+    def test_the_one_row_tab_does_not_move_backwards(self) -> None:
+        # A backlog arrives carrying old timestamps. Because the window already
+        # holds what the sheet had, the newest row stays the newest row.
+        window = self.merge([], [self.reading(5)])
+        latest = bq.current_block(window)
+        after_backlog = bq.current_block(self.merge(window, [self.reading(600)]))
+        self.assertEqual(after_backlog[1], latest[1])
+
+    def test_an_empty_window_writes_no_one_row_block(self) -> None:
+        # Better to leave the last known reading showing than to blank the tab
+        # because every reading in a batch was too old to keep.
+        self.assertEqual(bq.current_block([]), [])
+
     def test_the_written_range_covers_the_header_and_every_row(self) -> None:
         self.assertEqual(bq.sheet_range("recent", 3), "recent!A1:H4")
         # An empty window still rewrites the header, so the tab never looks

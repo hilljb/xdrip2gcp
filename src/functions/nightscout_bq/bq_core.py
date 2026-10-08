@@ -484,6 +484,24 @@ def merge_sheet_window(
     return [window[key] for key in sorted(window, reverse=True)]
 
 
+def current_block(window: Sequence[Sequence[Any]]) -> list[list[Any]]:
+    """The header and the single newest row, for the one-row tab.
+
+    Looker Studio applies row limits after aggregation, which makes "show me
+    only the latest reading" awkward to express in a chart. A tab that holds
+    exactly one row sidesteps it: any chart built on it is already showing the
+    newest reading, with no filter, sort or limit to get wrong.
+
+    Taking `window[0]` is what makes this monotonic for free. The window holds
+    the rows already in the sheet as well as the new ones and is ordered newest
+    first, so a batch of nothing but old readings leaves the previous newest row
+    in place rather than moving the displayed value backwards.
+    """
+    if not window:
+        return []
+    return [list(SHEET_HEADER), list(window[0])]
+
+
 def sheet_range(tab: str, row_count: int, columns: int = len(SHEET_HEADER)) -> str:
     """The A1 range covering the header plus `row_count` rows."""
     last_column = chr(ord("A") + columns - 1)

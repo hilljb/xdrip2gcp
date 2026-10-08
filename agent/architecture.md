@@ -179,6 +179,13 @@ window is under 300 rows, which is small enough that the function reads the shee
 upload, merges by reading time, drops what has aged out, and writes the block again. That is why no
 BigQuery read permission was restored for it: the sheet is the window's only storage.
 
+It writes **two tabs**: `recent` holds the window, and `current` holds the header plus one row, the
+newest reading. The second exists because Looker applies row limits after aggregation, so a one-row
+tab is the simplest way to chart only the latest value. It is `window[0]`, which inherits the
+window's ordering and therefore never moves backwards on a backlog — the same guarantee
+`supersedes()` gives Firestore, with no second comparison to maintain. Neither tab is created by any
+script; a missing one fails as `400 Unable to parse range`.
+
 **The spreadsheet is not a project resource.** Worth being explicit, because it is the only one:
 `cgm.entries` and `current/entries` live inside the GCP project and are created by the setup
 scripts, while the spreadsheet is a file in the operator's personal Drive that the project merely
