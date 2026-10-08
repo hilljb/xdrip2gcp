@@ -98,6 +98,7 @@ class SheetsConfig:
 
     spreadsheet_id: str
     tab: str
+    current_tab: str
     window_hours: int
 
     @property
@@ -533,6 +534,7 @@ def load_config(
         sheets=SheetsConfig(
             spreadsheet_id=str(sheets.get("spreadsheet_id", "")).strip(),
             tab=str(sheets.get("tab", "recent")).strip(),
+            current_tab=str(sheets.get("current_tab", "current")).strip(),
             window_hours=window_hours,
         ),
         auth=AuthConfig(

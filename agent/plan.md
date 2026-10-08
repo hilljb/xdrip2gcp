@@ -1019,6 +1019,9 @@ one upload every five minutes, the quota is irrelevant.
 
 ### 6.2 What the sheet holds
 
+Two tabs, with the same columns. `recent` holds the rolling window, and `current` holds the header
+and exactly one row — see 6.10 for why a one-row tab is worth having at all.
+
 One header row, then one row per reading, newest first:
 
 ```
@@ -1205,9 +1208,17 @@ it a moment later anyway.
 
 Three steps, unavoidable given where a spreadsheet lives:
 
-1. Create a spreadsheet. Note its ID from the URL, the part between `/d/` and `/edit`.
+1. Create a spreadsheet with two tabs, `recent` and `current`. Note its ID from the URL, the part
+   between `/d/` and `/edit`.
 2. Share it as **Editor** with the runtime identity's email address.
 3. Put the ID in `resources/config.local.toml` under `[sheets] spreadsheet_id`.
+
+The tabs have to exist beforehand. Creating them from the function would be possible — the identity
+is an Editor, so `batchUpdate` with `addSheet` would work — but it cannot be done from
+`deploy_bq_function.py`, where it belongs, because a local `gcloud` token cannot call the Sheets API
+at all (6.5). Rather than put provisioning in the upload path and exercise it once a year, a missing
+tab is left to fail loudly: the API answers `400 Unable to parse range: <tab>!A1:H2`, which names
+the problem precisely.
 
 `sheets.googleapis.com` is added to `[gcp] services`, so the existing setup script enables it, and
 `deploy_bq_function.py` prints the address to share with.
@@ -1227,3 +1238,32 @@ Looker also authorizes as the Google account signed in to Looker Studio, not as 
 identity, so the two access paths are independent: the service account is an Editor so it can write,
 and you reach the same file as its owner. Setting the data source to **Owner's Credentials** means
 anyone you later show the dashboard to does not need access to the sheet at all.
+
+### 6.10 A second tab holding only the newest reading
+
+Added after the first week of dashboard work, for a reason that is worth recording because it is not
+obvious from the outside: **Looker Studio applies row limits after aggregation**, so "chart only the
+most recent reading" is awkward to express. Sorting descending and limiting to one row does not do
+it for the chart types that aggregate, and the alternatives — a filter on a computed maximum, or a
+blend against a one-row aggregate — are fragile enough to be worth avoiding.
+
+A tab containing exactly one row makes the question disappear. Any chart built on `current` is
+already showing the newest reading, with no sort, filter or limit that can be got wrong.
+
+Three properties fall out of the existing design rather than needing new machinery:
+
+* **The row is the first row of the merged window.** The window already holds what the sheet had,
+  ordered newest first, so `window[0]` is the newest reading known — not merely the newest of the
+  batch. A backlog of old readings therefore leaves the tab alone, exactly as `supersedes()` does
+  for Firestore, without a second comparison to write or get wrong.
+* **It is always two rows**, header plus one, so unlike the window it can never shrink and needs no
+  clearing pass.
+* **An empty window writes nothing**, leaving the last known reading on display rather than blanking
+  the tab because every reading in a batch happened to be too old to keep.
+
+This overlaps with the Firestore document, which is also "the newest reading" — deliberately. The
+difference is who can read it: Looker Studio has a Sheets connector and no Firestore connector, so
+the document serves code and this tab serves the dashboard. The cost is one more API call per
+upload, against the same 60-second timeout.
+
+Setting `[sheets] current_tab = ""` turns it off and writes only the window.

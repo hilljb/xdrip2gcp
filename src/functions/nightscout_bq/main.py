@@ -52,6 +52,7 @@ COLLECTION_ENV = "XDRIP2GCP_FS_COLLECTION"
 DOCUMENT_ENV = "XDRIP2GCP_FS_DOCUMENT"
 SHEET_ID_ENV = "XDRIP2GCP_SHEET_ID"
 SHEET_TAB_ENV = "XDRIP2GCP_SHEET_TAB"
+SHEET_CURRENT_TAB_ENV = "XDRIP2GCP_SHEET_CURRENT_TAB"
 SHEET_HOURS_ENV = "XDRIP2GCP_SHEET_HOURS"
 SECRET_ENV = "NIGHTSCOUT_SECRET"
 HEADER_ENV = "XDRIP2GCP_AUTH_HEADER"
@@ -291,6 +292,7 @@ def _mirror_recent(rows: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
         return "skipped", 0
 
     tab = os.environ.get(SHEET_TAB_ENV, "recent").strip() or "recent"
+    current_tab = os.environ.get(SHEET_CURRENT_TAB_ENV, "").strip()
     hours = int(os.environ.get(SHEET_HOURS_ENV, "24"))
 
     try:
@@ -321,6 +323,19 @@ def _mirror_recent(rows: Sequence[Mapping[str, Any]]) -> tuple[str, int]:
                 timeout=SHEETS_TIMEOUT_SECONDS,
             )
             cleared.raise_for_status()
+
+        # The one-row tab, for charts that should show only the newest reading.
+        # Always exactly two rows, so nothing below it ever needs clearing.
+        latest = bq_core.current_block(window) if current_tab else []
+        if latest:
+            newest = session.put(
+                f"{SHEETS_API}/{spreadsheet}/values"
+                f"/{urllib.parse.quote(bq_core.sheet_range(current_tab, 1))}",
+                params={"valueInputOption": "USER_ENTERED"},
+                json={"values": latest},
+                timeout=SHEETS_TIMEOUT_SECONDS,
+            )
+            newest.raise_for_status()
 
         return "updated", len(window)
     except Exception as error:  # noqa: BLE001 - derived state; log and carry on
